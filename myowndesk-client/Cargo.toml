@@ -5,3 +5,16 @@ edition = "2021"
 
 [dependencies]
 myowndesk-protocol = { path = "../myowndesk-protocol" }
+tokio = { version = "1", features = ["full"] }
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_SystemServices",
+]}
+windows-service = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"

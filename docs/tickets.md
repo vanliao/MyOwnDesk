@@ -82,13 +82,13 @@ Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message
 
 **Blocked by:** 01（项目骨架 + 协议定义）
 
-**Status:** ready-for-agent
+**Status:** ✅ done
 
-- [ ] Windows 服务注册/启动/停止（`--service` 参数）
-- [ ] DXGI 枚举显示器，选择主显示器
-- [ ] `IDXGIOutputDuplication::AcquireNextFrame` 捕获 D3D11 纹理
-- [ ] 60fps 捕获循环，纹理输出到 channel（`tokio::sync::mpsc`）
-- [ ] 服务进程日志输出（`tracing`）
+- [x] Windows 服务注册/启动/停止（`--service` 参数，Ctrl+C 退出；SCM install/uninstall 预留）
+- [x] DXGI 枚举显示器，选择主显示器（`IDXGIOutputDuplication`）
+- [x] `IDXGIOutputDuplication::AcquireNextFrame` 捕获 D3D11 纹理（BGRA 格式）
+- [x] 60fps 捕获循环，纹理输出到 channel（`tokio::sync::mpsc::UnboundedSender<CapturedFrame>`）
+- [x] 服务进程日志输出（`tracing`）
 
 ---
 
