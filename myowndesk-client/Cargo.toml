@@ -18,3 +18,17 @@ windows-service = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
+openh264 = { version = "0.9", features = ["source"] }
+libc = "0.2"
+thiserror = "1"
+quinn = "0.11.11"
+ring = "0.17.14"
+hex = "0.4.3"
+prost = "0.13"
+bytes = "1.12.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.3"
+rustls = "0.23"
+
+[dev-dependencies]
+tempfile = "3.27.0"

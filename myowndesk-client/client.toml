@@ -1,0 +1,9 @@
+# MyOwnDesk 客户端配置
+# 复制此文件后填写预共享密钥（从中继服务器启动日志中获取）
+
+[server]
+address = "127.0.0.1:21117"
+
+[device]
+id = ""                 # 设备标识，留空则自动使用主机名
+pre_shared_key = ""     # 从中继服务器的 relay.toml 复制

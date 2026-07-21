@@ -21,9 +21,15 @@ use windows::Win32::Graphics::Dxgi::*;
 /// 捕获帧——通过 channel 传递给编码器（Ticket-04）
 ///
 /// 纹理格式: `DXGI_FORMAT_B8G8R8A8_UNORM`
+///
+/// 包含两路数据：
+/// - `texture`: GPU 纹理（供未来硬件编码使用，None 时表示不可用）
+/// - `cpu_buffer`: BGRA 像素数据（供当前软编使用，由 capture 线程回读）
 pub struct CapturedFrame {
     /// D3D11 纹理（自有纹理，ID3D11Device::CreateTexture2D 创建）
-    pub texture: ID3D11Texture2D,
+    pub texture: Option<ID3D11Texture2D>,
+    /// BGRA 像素数据（CPU 回读，供软编使用）
+    pub cpu_buffer: Vec<u8>,
     /// 显示器索引（0 = 主屏）
     pub display_index: u32,
     /// 捕获时间戳
@@ -49,6 +55,8 @@ pub struct ScreenDuplicator {
     context: ID3D11DeviceContext,
     /// 自有纹理（用于拷贝桌面表面，每帧复用）
     owned_texture: Option<ID3D11Texture2D>,
+    /// Staging 纹理（用于 CPU 回读，每帧复用）
+    staging_texture: Option<ID3D11Texture2D>,
     /// 纹理宽度
     width: u32,
     /// 纹理高度
@@ -114,8 +122,10 @@ impl ScreenDuplicator {
             device_name
         );
 
-        // 6. 预创建自有纹理
-        let owned_texture = create_staging_texture(device, width, height)?;
+        // 6. 预创建自有纹理（GPU 端，用于复制桌面表面）
+        let owned_texture = create_default_texture(device, width, height)?;
+        // 预创建 staging 纹理（CPU 端，用于回读像素数据）
+        let staging_texture = create_staging_readback_texture(device, width, height)?;
 
         Ok(Self {
             duplication,
@@ -123,6 +133,7 @@ impl ScreenDuplicator {
             device: device.clone(),
             context: context.clone(),
             owned_texture: Some(owned_texture),
+            staging_texture: Some(staging_texture),
             width,
             height,
         })
@@ -173,6 +184,61 @@ impl ScreenDuplicator {
             unsafe {
                 self.context.CopyResource(&dst, &src);
             }
+
+            // CPU 回读：CopyResource(owned → staging) → Map → 读像素
+            if let Some(ref staging) = self.staging_texture {
+                let staging_res: windows::Win32::Graphics::Direct3D11::ID3D11Resource =
+                    staging.clone().cast()?;
+                unsafe {
+                    self.context.CopyResource(&staging_res, &dst);
+                }
+
+            use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
+
+                // Map staging texture 读像素
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                let map_result = unsafe {
+                    self.context.Map(
+                        &staging_res,
+                        0,
+                        windows::Win32::Graphics::Direct3D11::D3D11_MAP_READ,
+                        0,
+                        Some(&mut mapped),
+                    )
+                };
+
+                match map_result {
+                    Ok(()) => {
+                        let src_ptr = mapped.pData as *const u8;
+                        let row_pitch = mapped.RowPitch as usize;
+                        let buf_size = (self.height as usize) * row_pitch;
+                        let mut cpu_buffer = vec![0u8; buf_size];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src_ptr, cpu_buffer.as_mut_ptr(), buf_size);
+                        }
+                        unsafe {
+                            self.context.Unmap(&staging_res, 0);
+                        }
+
+                        // 构造 CapturedFrame，包含 cpu_buffer
+                        let frame = CapturedFrame {
+                            texture: self.owned_texture.as_ref().map(|t| t.clone()),
+                            cpu_buffer,
+                            display_index: 0,
+                            timestamp: Instant::now(),
+                            width: self.width,
+                            height: self.height,
+                        };
+                        // 释放帧
+                        unsafe { self.duplication.ReleaseFrame() }
+                            .map_err(|e| anyhow::anyhow!("ReleaseFrame 失败: {}", e))?;
+                        return Ok(Some(frame));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Map staging 纹理失败: {}, 跳过 CPU 回读", e);
+                    }
+                }
+            }
         }
 
         // 释放帧
@@ -180,7 +246,8 @@ impl ScreenDuplicator {
             .map_err(|e| anyhow::anyhow!("ReleaseFrame 失败: {}", e))?;
 
         let frame = CapturedFrame {
-            texture: self.owned_texture.as_ref().unwrap().clone(),
+            texture: self.owned_texture.as_ref().map(|t| t.clone()),
+            cpu_buffer: Vec::new(), // 回读失败时为空
             display_index: 0,
             timestamp: Instant::now(),
             width: self.width,
@@ -226,7 +293,8 @@ impl ScreenDuplicator {
 // 辅助函数
 // ============================================================
 
-fn create_staging_texture(
+/// 创建 GPU 默认纹理（用于 CopyResource 目的，GPU 端储存）
+fn create_default_texture(
     device: &ID3D11Device,
     width: u32,
     height: u32,
@@ -251,7 +319,38 @@ fn create_staging_texture(
         let mut texture: Option<ID3D11Texture2D> = None;
         device
             .CreateTexture2D(&desc, None, Some(&mut texture))
-            .map_err(|e| anyhow::anyhow!("CreateTexture2D 失败: {}", e))?;
-        texture.ok_or_else(|| anyhow::anyhow!("CreateTexture2D 返回空纹理"))
+            .map_err(|e| anyhow::anyhow!("CreateTexture2D(默认) 失败: {}", e))?;
+        texture.ok_or_else(|| anyhow::anyhow!("CreateTexture2D(默认) 返回空纹理"))
+    }
+}
+
+/// 创建 CPU 可读的 staging 纹理（用于 D3D11 纹理 → CPU 回读）
+fn create_staging_readback_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+
+    unsafe {
+        let mut texture: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut texture))
+            .map_err(|e| anyhow::anyhow!("CreateTexture2D(staging) 失败: {}", e))?;
+        texture.ok_or_else(|| anyhow::anyhow!("CreateTexture2D(staging) 返回空纹理"))
     }
 }

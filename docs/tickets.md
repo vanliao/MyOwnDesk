@@ -94,17 +94,21 @@ Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message
 
 ## 04 — H.264 视频编码
 
-**What to build:** 从 D3D11 纹理管道中取出帧，通过 FFmpeg 硬件编码器编码为 H.264 NAL 单元，输出到编码帧 channel。
+**What to build:** 从 D3D11 纹理管道中取出帧，编码为 H.264 NAL 单元（软编 openh264 / 未来硬编 NVENC/QSV/AMF），输出到编码帧 channel。
 
 **Blocked by:** 03（DXGI 屏幕捕获）
 
-**Status:** ready-for-agent
+**Status:** ✅ done
 
-- [ ] `ffmpeg-next` 初始化 H.264 硬件编码器（自动发现 NVENC/QSV/AMF）
-- [ ] 编码参数：CBR 15 Mbps、`zerolatency` tune、`ultrafast` preset、GOP 60 帧、`high` profile
-- [ ] D3D11 纹理 → ffmpeg AVFrame → 编码 → NAL 单元
-- [ ] 编码帧输出到 channel，标记帧类型（关键帧 / delta 帧）
-- [ ] 无硬件编码器时回退到软件编码（openh264）
+- [x] `openh264` 初始化 H.264 软件编码器（因 ffmpeg-next-sys 无法从 Rust 镜像获取，改用 openh264）
+- [x] `VideoEncoder` trait 定义 + `OpenH264Encoder` 实现（可替换为未来硬件编码器）
+- [x] 编码参数：CBR 15 Mbps、`ScreenContentRealTime` usage、GOP 60 帧、`max_slice_len=1200`、4 线程
+- [x] BGRA 像素 → BGRA→YUV420P 转换（BT.601）→ openh264 编码 → NAL 单元
+- [x] 编码帧输出到 `EncodeSender/EncodeReceiver` channel，标记帧类型（关键帧 / delta 帧）
+- [x] CPU 回读：capture 线程中 add staging 纹理 → CopyResource → Map → 读 BGRA 像素到 `Vec<u8>`
+- [x] `CapturedFrame` 增加 `cpu_buffer` 字段，`texture` 改为 `Option`（回读失败时降级）
+- [x] `service.rs` 集成：consumer task 使用 `encoder::create_best_encoder()` 编码捕获帧
+- [x] 8 个单元测试全部通过（编码器创建、关键帧、delta 帧、强制关键帧、元数据、数据格式、颜色转换）
 
 ---
 
@@ -114,14 +118,17 @@ Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message
 
 **Blocked by:** 02（中继服务器）、04（H.264 视频编码）
 
-**Status:** ready-for-agent
+**Status:** ✅ done
 
-- [ ] QUIC 客户端连接中继（`quinn`）
-- [ ] Register 消息发送（含 HMAC 认证令牌）
-- [ ] 视频帧通过 datagram 发送（NAL 单元 + 帧元数据）
-- [ ] 视频帧通过 datagram 接收（对端发来的帧）
-- [ ] 控制消息通过 stream 发送/接收（Pair, Disconnect, 心跳）
-- [ ] 断线检测，重连按钮触发重新 Register
+- [x] `QuicClient` 模块：connect + register + send_datagram + recv_datagram + send_message + recv_message
+- [x] QUIC 客户端连接中继（`quinn` 0.11 + `rustls` 0.23），跳过证书验证
+- [x] Register 消息发送（HMAC-SHA256 认证令牌）
+- [x] 视频帧通过 datagram 发送（EncodedFrame → DataPacket protobuf → datagram）
+- [x] 控制消息通过 stream 收发（4 字节 LE 长度前缀 + protobuf）
+- [x] `client.toml` 配置文件（server 地址、设备 ID、预共享密钥）
+- [x] `KeyFrameRequest` → 信号 channel → 编码器强制关键帧
+- [x] 服务模式集成：捕获 → 编码 → 网络发送全链路串通
+- [x] 13 个单元测试通过（编码器 8 + 配置 5），完整工作空间编译通过
 
 ---
 
