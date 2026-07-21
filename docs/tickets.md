@@ -18,14 +18,40 @@
 
 **Blocked by:** 无 — 可立即开始
 
-**Status:** ready-for-agent
+**Status:** ✅ done
 
-- [ ] 创建 `myowndesk-protocol` crate，含 `.proto` 文件（Register, Pair, Disconnect, DataPacket, KeyEvent, MouseEvent, Ping/Pong 等）
-- [ ] 配置 `prost` 编译 `.proto` 生成 Rust 代码
-- [ ] 创建 `myowndesk-client` crate，依赖 protocol
-- [ ] 创建 `myowndesk-relay` crate，依赖 protocol
-- [ ] 三个 crate 均 `cargo build` 通过
-- [ ] `FrameCipher` trait 定义 + `NoOpCipher` 空实现
+- [x] 创建 `myowndesk-protocol` crate，含 `.proto` 文件（15 个消息 + 4 个枚举，详见下方消息清单）
+- [x] 配置 `prost` + `protoc-bin-vendored` 编译 `.proto` 生成 Rust 代码
+- [x] 创建 `myowndesk-client` crate（lib + bin 结构），依赖 protocol
+- [x] 创建 `myowndesk-relay` crate，依赖 protocol
+- [x] 三个 crate 均 `cargo build` 通过
+- [x] `FrameCipher` trait 定义 + `NoOpCipher` 空实现
+- [x] `FrameFragmenter` trait 定义 + `NoOpFragmenter` 空实现（视频帧分包，预留）
+- [x] ADR: 视频帧分片策略 (`docs/adr/0001-video-frame-fragmentation.md`)
+
+**实现细节：**
+
+Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message` 信封 + `oneof type`：
+
+| 消息 | 关键字段 | 说明 |
+|------|---------|------|
+| `Register` | `device_id`, `auth_token`, `protocol_version` | 设备上线注册，protocol_version 当前为 1 |
+| `RegisterResponse` | `error_code`, `error_message`, `online_devices` | 注册结果 + 在线设备列表 |
+| `Pair` | `target_device_id` | 发起配对 |
+| `PairResponse` | `error_code`, `error_message` | 配对结果 |
+| `Disconnect` | `reason` | 控制端主动断开 |
+| `PeerDisconnected` | `reason` | 中继通知对端已离线（被控端收到后也锁屏） |
+| `DataPacket` | `frame_type`, `display_index`, `payload` | 视频帧（单个 NAL unit），预留分包 + E2E 加密字段 |
+| `KeyEvent` | `key_code`, `pressed` | Windows 虚拟键码 |
+| `MouseEvent` | `event_type`, `x`, `y`, `button`, `wheel_delta` | 绝对坐标鼠标事件 |
+| `Ping` / `Pong` | `timestamp_ms` | 心跳保活 |
+| `SwitchDisplay` | `display_index` | 切屏请求 |
+| `KeyFrameRequest` | `display_index` | 丢包后请求 I 帧 |
+| `DeviceList` | `device_ids` | 设备上下线增量推送 |
+
+枚举：`ErrorCode`（OK / AUTH_FAILED / DEVICE_NOT_FOUND / ALREADY_PAIRED / INTERNAL）、`FrameType`（KEYFRAME / DELTA）、`MouseEventType`（MOVE / BUTTON_DOWN / BUTTON_UP / WHEEL）、`MouseButton`（LEFT / RIGHT / MIDDLE）
+
+预留字段：`DataPacket` 含 `frame_seq` / `fragment_index` / `fragment_count`（分包）、`encrypted_payload` / `nonce` / `key_version`（E2E 加密）
 
 ---
 

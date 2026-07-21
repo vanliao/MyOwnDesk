@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "myowndesk-protocol",
+    "myowndesk-client",
+    "myowndesk-relay",
+]
+resolver = "2"

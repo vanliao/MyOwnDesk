@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+package myowndesk;
+
+// ============================================================
+// 消息信封
+// ============================================================
+
+message Message {
+  oneof type {
+    Register register = 1;
+    RegisterResponse register_response = 2;
+    Pair pair = 3;
+    PairResponse pair_response = 4;
+    Disconnect disconnect = 5;
+    PeerDisconnected peer_disconnected = 6;
+    DataPacket data_packet = 7;
+    KeyEvent key_event = 8;
+    MouseEvent mouse_event = 9;
+    Ping ping = 10;
+    Pong pong = 11;
+    SwitchDisplay switch_display = 12;
+    KeyFrameRequest key_frame_request = 13;
+    DeviceList device_list = 14;
+  }
+}
+
+// ============================================================
+// 错误码
+// ============================================================
+
+enum ErrorCode {
+  OK = 0;
+  AUTH_FAILED = 1;
+  DEVICE_NOT_FOUND = 2;
+  ALREADY_PAIRED = 3;
+  INTERNAL = 4;
+}
+
+// ============================================================
+// 连接管理
+// ============================================================
+
+message Register {
+  string device_id = 1;
+  bytes auth_token = 2;          // HMAC-SHA256(预共享密钥, device_id)
+  uint32 protocol_version = 3;   // 当前版本: 1
+}
+
+message RegisterResponse {
+  ErrorCode error_code = 1;
+  string error_message = 2;
+  repeated string online_devices = 3;
+}
+
+message Pair {
+  string target_device_id = 1;
+}
+
+message PairResponse {
+  ErrorCode error_code = 1;
+  string error_message = 2;
+}
+
+// 控制端主动断开连接
+message Disconnect {
+  string reason = 1;
+}
+
+// 中继通知：对端已离线（被控端收到后也锁屏）
+message PeerDisconnected {
+  string reason = 1;
+}
+
+// ============================================================
+// 视频帧
+// ============================================================
+
+enum FrameType {
+  KEYFRAME = 0;
+  DELTA = 1;
+}
+
+message DataPacket {
+  FrameType frame_type = 1;
+  uint32 display_index = 2;      // 0 = 主屏, 1 = 副屏
+  bytes payload = 3;             // 单个 NAL unit（不含起始码）
+
+  // 分包字段（预留，NAL unit 超过 MTU 时使用）
+  uint32 frame_seq = 4;          // 帧序号
+  uint32 fragment_index = 5;     // 分片索引
+  uint32 fragment_count = 6;     // 总分片数（0 = 未分片）
+
+  // 端到端加密（预留）
+  bytes encrypted_payload = 7;
+  bytes nonce = 8;
+  uint32 key_version = 9;
+}
+
+// ============================================================
+// 输入事件
+// ============================================================
+
+message KeyEvent {
+  uint32 key_code = 1;           // Windows 虚拟键码 (VK_*)
+  bool pressed = 2;              // true = 按下, false = 释放
+}
+
+enum MouseEventType {
+  MOVE = 0;
+  BUTTON_DOWN = 1;
+  BUTTON_UP = 2;
+  WHEEL = 3;
+}
+
+enum MouseButton {
+  LEFT = 0;
+  RIGHT = 1;
+  MIDDLE = 2;
+}
+
+message MouseEvent {
+  MouseEventType event_type = 1;
+  int32 x = 2;                   // 被控端桌面的绝对坐标
+  int32 y = 3;
+  MouseButton button = 4;
+  int32 wheel_delta = 5;         // 正 = 向上滚动, 负 = 向下滚动
+}
+
+// ============================================================
+// 心跳保活
+// ============================================================
+
+message Ping {
+  int64 timestamp_ms = 1;
+}
+
+message Pong {
+  int64 timestamp_ms = 1;
+}
+
+// ============================================================
+// 切屏 & 关键帧请求
+// ============================================================
+
+message SwitchDisplay {
+  uint32 display_index = 1;
+}
+
+message KeyFrameRequest {
+  uint32 display_index = 1;
+}
+
+// ============================================================
+// 设备列表（增量推送）
+// ============================================================
+
+message DeviceList {
+  repeated string device_ids = 1;
+}
