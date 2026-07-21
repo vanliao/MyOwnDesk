@@ -33,21 +33,21 @@
 
 Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message` 信封 + `oneof type`：
 
-| 消息 | 关键字段 | 说明 |
-|------|---------|------|
-| `Register` | `device_id`, `auth_token`, `protocol_version` | 设备上线注册，protocol_version 当前为 1 |
-| `RegisterResponse` | `error_code`, `error_message`, `online_devices` | 注册结果 + 在线设备列表 |
-| `Pair` | `target_device_id` | 发起配对 |
-| `PairResponse` | `error_code`, `error_message` | 配对结果 |
-| `Disconnect` | `reason` | 控制端主动断开 |
-| `PeerDisconnected` | `reason` | 中继通知对端已离线（被控端收到后也锁屏） |
-| `DataPacket` | `frame_type`, `display_index`, `payload` | 视频帧（单个 NAL unit），预留分包 + E2E 加密字段 |
-| `KeyEvent` | `key_code`, `pressed` | Windows 虚拟键码 |
-| `MouseEvent` | `event_type`, `x`, `y`, `button`, `wheel_delta` | 绝对坐标鼠标事件 |
-| `Ping` / `Pong` | `timestamp_ms` | 心跳保活 |
-| `SwitchDisplay` | `display_index` | 切屏请求 |
-| `KeyFrameRequest` | `display_index` | 丢包后请求 I 帧 |
-| `DeviceList` | `device_ids` | 设备上下线增量推送 |
+| 消息                 | 关键字段                                            | 说明                               |
+| ------------------ | ----------------------------------------------- | -------------------------------- |
+| `Register`         | `device_id`, `auth_token`, `protocol_version`   | 设备上线注册，protocol_version 当前为 1    |
+| `RegisterResponse` | `error_code`, `error_message`, `online_devices` | 注册结果 + 在线设备列表                    |
+| `Pair`             | `target_device_id`                              | 发起配对                             |
+| `PairResponse`     | `error_code`, `error_message`                   | 配对结果                             |
+| `Disconnect`       | `reason`                                        | 控制端主动断开                          |
+| `PeerDisconnected` | `reason`                                        | 中继通知对端已离线（被控端收到后也锁屏）             |
+| `DataPacket`       | `frame_type`, `display_index`, `payload`        | 视频帧（单个 NAL unit），预留分包 + E2E 加密字段 |
+| `KeyEvent`         | `key_code`, `pressed`                           | Windows 虚拟键码                     |
+| `MouseEvent`       | `event_type`, `x`, `y`, `button`, `wheel_delta` | 绝对坐标鼠标事件                         |
+| `Ping` / `Pong`    | `timestamp_ms`                                  | 心跳保活                             |
+| `SwitchDisplay`    | `display_index`                                 | 切屏请求                             |
+| `KeyFrameRequest`  | `display_index`                                 | 丢包后请求 I 帧                        |
+| `DeviceList`       | `device_ids`                                    | 设备上下线增量推送                        |
 
 枚举：`ErrorCode`（OK / AUTH_FAILED / DEVICE_NOT_FOUND / ALREADY_PAIRED / INTERNAL）、`FrameType`（KEYFRAME / DELTA）、`MouseEventType`（MOVE / BUTTON_DOWN / BUTTON_UP / WHEEL）、`MouseButton`（LEFT / RIGHT / MIDDLE）
 
@@ -61,17 +61,18 @@ Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message
 
 **Blocked by:** 01（项目骨架 + 协议定义）
 
-**Status:** ready-for-agent
+**Status:** ✅ done
 
-- [ ] QUIC server 监听配置端口
-- [ ] Register 消息处理：验证 HMAC-SHA256(预共享密钥, device_id)，注册到在线设备表
-- [ ] 在线设备表：`HashMap<DeviceId, Connection>`，含超时清理
-- [ ] Pair 消息处理：查找目标设备，配对双方连接
-- [ ] 双向数据转发：A 收到 DataPacket → 发给 B，反之亦然
-- [ ] Disconnect 消息处理：解绑配对，通知对端
-- [ ] 心跳 Ping/Pong 保活
-- [ ] 未知设备 Pair 时返回错误
-- [ ] 错误 auth_token Register 时拒绝
+- [x] QUIC server 监听配置端口（`0.0.0.0:21117`，可配置）
+- [x] Register 消息处理：验证 HMAC-SHA256(预共享密钥, device_id)，注册到在线设备表
+- [x] 在线设备表：`HashMap<DeviceId, DeviceEntry>`，含超时清理
+- [x] Pair 消息处理：查找目标设备，配对双方连接
+- [x] 双向数据转发：A 收到 DataPacket(datagram) → 发给 B；KeyEvent/MouseEvent(stream) → 转发给对端
+- [x] Disconnect 消息处理：解绑配对，通知对端
+- [x] 心跳 Ping/Pong 保活（10s 间隔，30s 超时）
+- [x] 未知设备 Pair 时返回 `PairResponse(error_code=DEVICE_NOT_FOUND)`
+- [x] 错误 auth_token Register 时返回 `RegisterResponse(error_code=AUTH_FAILED)`
+- [x] 集成测试覆盖（9 个测试用例，真实 QUIC 连接）
 
 ---
 

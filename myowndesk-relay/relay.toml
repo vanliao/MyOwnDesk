@@ -1,0 +1,12 @@
+# MyOwnDesk 中继服务器配置
+listen_address = "0.0.0.0:12345"
+
+# 预共享密钥（首次启动自动生成 256-bit 随机密钥，复制到各客户端配置文件）
+# 格式：64 个 hex 字符
+pre_shared_key = ""
+
+# 心跳间隔（秒）
+heartbeat_interval_secs = 10
+
+# 心跳超时（秒），超过此时间未收到 Pong 则断开连接
+heartbeat_timeout_secs = 30
