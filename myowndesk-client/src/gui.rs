@@ -16,7 +16,7 @@
 //! ```
 
 use crate::config::ClientConfig;
-use crate::decoder::{create_best_decoder, DecodedFrame, OpenH264Decoder};
+use crate::decoder::{create_best_decoder, DecodedFrame};
 use crate::net::QuicClient;
 use minifb::{Key, Window, WindowOptions};
 use myowndesk_protocol as proto;
@@ -205,9 +205,11 @@ async fn run_network(
         let mut frame_buf: Vec<u8> = Vec::new();
         let mut current_seq: u32 = 0;
         let mut assembled_count: u64 = 0;
+        let flush_timeout = std::time::Duration::from_millis(500);
         loop {
-            match conn.read_datagram().await {
-                Ok(data) => match proto::Message::decode(data.as_ref()) {
+            match tokio::time::timeout(flush_timeout, conn.read_datagram()).await {
+                // 收到 datagram
+                Ok(Ok(data)) => match proto::Message::decode(data.as_ref()) {
                     Ok(msg) => match msg.r#type {
                         Some(proto::message::Type::DataPacket(dp)) => {
                             if dp.frame_seq != current_seq && !frame_buf.is_empty() {
@@ -231,9 +233,19 @@ async fn run_network(
                     },
                     Err(_) => {}
                 },
-                Err(e) => {
+                // 连接错误
+                Ok(Err(e)) => {
                     tracing::warn!("datagram 接收失败: {}", e);
                     break;
+                }
+                // 超时——屏幕静止，发当前帧
+                Err(_) => {
+                    if !frame_buf.is_empty() {
+                        assembled_count += 1;
+                        if nal_tx2.send(std::mem::take(&mut frame_buf)).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -297,41 +309,39 @@ fn run_decoder(
 ) -> anyhow::Result<()> {
     let mut decoder = create_best_decoder()?;
     let mut total_frames: u64 = 0;
-    let mut error_recovering = false;
 
-    while let Some(nal_units) = nal_rx.blocking_recv() {
-        // 错误恢复中：跳过非 IDR 帧直到下一个 keyframe
-        if error_recovering {
-            if OpenH264Decoder::contains_idr(&nal_units) {
-                error_recovering = false;
-                decoder = create_best_decoder()?;
-                tracing::info!("解码器已恢复（收到新 keyframe）");
-            } else {
-                continue;
-            }
+    while let Some(first) = nal_rx.blocking_recv() {
+        // 批量处理：拿到一帧后立刻清空队列，一次性解完
+        let mut batch = vec![first];
+        while let Ok(more) = nal_rx.try_recv() {
+            batch.push(more);
         }
-
-        match decoder.decode(&nal_units) {
-            Ok(frames) => {
-                for frame in frames {
-                    total_frames += 1;
-                    if total_frames % 60 == 1 {
-                        tracing::info!(
-                            "解码帧 #{}: {}x{} ({:?})",
-                            total_frames,
-                            frame.width,
-                            frame.height,
-                            frame.frame_type
-                        );
-                    }
-                    if rgb_tx.send(frame).is_err() {
-                        return Ok(());
+        for nal_units in batch {
+            let t0 = std::time::Instant::now();
+            match decoder.decode(&nal_units) {
+                Ok(frames) => {
+                    let decode_ms = t0.elapsed().as_millis();
+                    for frame in frames {
+                        total_frames += 1;
+                        if total_frames <= 5 || total_frames % 60 == 1 {
+                            tracing::info!(
+                                "解码帧 #{}: {}x{} ({:?}), decode={}ms",
+                                total_frames,
+                                frame.width,
+                                frame.height,
+                                frame.frame_type,
+                                decode_ms
+                            );
+                        }
+                        if rgb_tx.send(frame).is_err() {
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("解码帧失败: {}，进入恢复模式", e);
-                error_recovering = true;
+                Err(e) => {
+                    let decode_ms = t0.elapsed().as_millis();
+                    tracing::warn!("解码帧失败 ({}ms): {}", decode_ms, e);
+                }
             }
         }
     }
