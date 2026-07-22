@@ -2,8 +2,21 @@
 //!
 //! 启动 `--service` 时，创建 D3D11 设备、初始化屏幕捕获、
 //! 在专用线程中运行 60fps 捕获循环 → 编码 → 网络发送。
+//!
+//! # 架构
+//!
+//! 三个独立 actor 通过 channel 串联，`run()` 只负责编排：
+//!
+//! ```text
+//! ScreenDuplicator → CaptureLoop [线程]
+//!     │ bounded channel (cap 2)
+//!     ▼
+//! EncodeLoop [tokio task] ──→ EncodedFrame → QUIC datagram
+//!     ▲
+//!     └── keyframe_tx (来自 relay 的 KeyFrameRequest)
+//! ```
 
-use crate::capture::{CapturedFrame, ScreenDuplicator};
+use crate::capture::{CapturedFrame, FrameSource, ScreenDuplicator};
 use crate::config::ClientConfig;
 use crate::encoder::{self, EncodedFrame};
 use crate::net::{KeyFrameSender, QuicClient};
@@ -22,16 +35,130 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext,
 };
 
-/// 编码帧输出通道——供网络层消费
-pub type EncodeSender = mpsc::UnboundedSender<EncodedFrame>;
-pub type EncodeReceiver = mpsc::UnboundedReceiver<EncodedFrame>;
+// ============================================================
+// 通道类型别名
+// ============================================================
 
-/// `--service` 入口
+type CaptureSender = mpsc::Sender<CapturedFrame>;
+type CaptureReceiver = mpsc::Receiver<CapturedFrame>;
+type EncodeSender = mpsc::UnboundedSender<EncodedFrame>;
+type EncodeReceiver = mpsc::UnboundedReceiver<EncodedFrame>;
+
+// ============================================================
+// CaptureLoop — 屏幕捕获循环
+// ============================================================
+
+/// 管理 DXGI 捕获线程的创建、运行、停止。
+struct CaptureLoop {
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl CaptureLoop {
+    /// 启动捕获线程。
+    fn start(frame_source: Box<dyn FrameSource>, frame_tx: CaptureSender) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let mut frame_source = frame_source; // 让闭包捕获，允许在 capture_loop 中可变借用
+        let handle = {
+            let shutdown = shutdown.clone();
+            std::thread::spawn(move || {
+                capture_loop(&mut *frame_source, frame_tx, shutdown);
+            })
+        };
+        Self {
+            handle: Some(handle),
+            shutdown,
+        }
+    }
+
+    /// 发送停止信号并等待线程退出。
+    fn stop(&mut self) {
+        self.shutdown.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+// ============================================================
+// EncodeLoop — 编码循环
+// ============================================================
+
+/// 管理 H.264 编码 task 的创建、运行、停止。
+struct EncodeLoop {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl EncodeLoop {
+    /// 启动编码 task，消费捕获帧、响应 keyframe 信号。
+    fn start(
+        capture_rx: CaptureReceiver,
+        encode_tx: EncodeSender,
+        keyframe_tx: KeyFrameSender,
+        keyframe_rx: mpsc::UnboundedReceiver<()>,
+    ) -> Self {
+        let handle = tokio::spawn(async move {
+            encode_task(capture_rx, encode_tx, keyframe_rx).await;
+        });
+        // keyframe_tx 给外部（network task）注入 KeyFrameRequest 信号
+        let _ = keyframe_tx;
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// 等待编码 task 完成（带超时）。
+    async fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        }
+    }
+}
+
+// ============================================================
+// NetworkLoop — 网络循环
+// ============================================================
+
+/// 管理 QUIC 网络 task 的创建、运行、停止。
+struct NetworkLoop {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl NetworkLoop {
+    /// 启动网络 task：连接中继 → 注册 → 发送帧 → 接收控制消息。
+    fn start(
+        server_addr: String,
+        device_id: String,
+        pre_shared_key: String,
+        encode_rx: EncodeReceiver,
+        keyframe_tx: KeyFrameSender,
+    ) -> Self {
+        let handle = tokio::spawn(async move {
+            network_task(server_addr, device_id, pre_shared_key, encode_rx, keyframe_tx).await;
+        });
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// 等待网络 task 完成（带超时）。
+    async fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        }
+    }
+}
+
+// ============================================================
+// `--service` 入口
+// ============================================================
+
+/// 服务模式主入口——编排 capture / encode / network 三个 actor。
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("MyOwnDesk 服务模式启动中...");
 
-    // 1. 加载客户端配置
+    // 1. 加载配置
     let config = ClientConfig::load("client.toml")?;
     let device_id = config.resolve_device_id();
     if config.device.pre_shared_key.is_empty() {
@@ -41,178 +168,196 @@ pub async fn run() -> anyhow::Result<()> {
 
     // 2. 创建 D3D11 设备 + 屏幕捕获
     let (device, context) = create_d3d11_device()?;
-    let mut duplicator = ScreenDuplicator::new(&device, &context)?;
+    let duplicator = ScreenDuplicator::new(&device, &context)?;
 
-    // 3. 创建通道（bounded 容量 2 防止帧堆积导致延迟）
-    let (capture_tx, mut capture_rx) = mpsc::channel::<CapturedFrame>(2);
-    let (encode_tx, mut encode_rx) = mpsc::unbounded_channel::<EncodedFrame>();
-    let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<()>();
-    let running = Arc::new(AtomicBool::new(true));
+    // 3. 创建通道
+    let (capture_tx, capture_rx) = mpsc::channel::<CapturedFrame>(2);
+    let (encode_tx, encode_rx) = mpsc::unbounded_channel::<EncodedFrame>();
+    let (keyframe_tx, keyframe_rx) = mpsc::unbounded_channel::<()>();
 
-    // 4. 捕获线程
-    let capture_handle = {
-        let running = running.clone();
-        std::thread::spawn(move || {
-            capture_loop(&mut duplicator, capture_tx, running);
-        })
-    };
+    // 4. 启动三个 actor（通过 Box<dyn FrameSource> 注入）
+    let mut capture = CaptureLoop::start(Box::new(duplicator), capture_tx);
+    let mut encode = EncodeLoop::start(capture_rx, encode_tx, keyframe_tx.clone(), keyframe_rx);
+    let mut network = NetworkLoop::start(
+        config.server.address.clone(),
+        device_id,
+        config.device.pre_shared_key.clone(),
+        encode_rx,
+        keyframe_tx,
+    );
 
-    // 5. 编码 task（消费捕获帧 → 编码，监听 keyframe 信号）
-    let encoder_handle = tokio::spawn(async move {
-        let mut frame_count: u64 = 0;
-        let mut encoder = match encoder::create_best_encoder(1920, 1080, 60) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("编码器初始化失败: {}", e);
-                return;
-            }
-        };
-        tracing::info!("编码器已就绪");
-
-        loop {
-            tokio::select! {
-                Some(frame) = capture_rx.recv() => {
-                    frame_count += 1;
-                    if frame.cpu_buffer.is_empty() {
-                        continue;
-                    }
-                    match encoder.encode(&frame) {
-                        Ok(encoded_frames) => {
-                            for ef in encoded_frames {
-                                if encode_tx.send(ef).is_err() {
-                                    tracing::info!("编码输出通道已关闭");
-                                    return;
-                                }
-                            }
-                            if frame_count % 60 == 1 {
-                                tracing::info!("帧 #{} 编码完成", frame_count);
-                            }
-                        }
-                        Err(e) => tracing::error!("帧 #{} 编码失败: {}", frame_count, e),
-                    }
-                }
-                Some(_) = keyframe_rx.recv() => {
-                    encoder.request_keyframe();
-                }
-                else => break,
-            }
-        }
-        tracing::info!("编码 task 退出，共 {} 帧", frame_count);
-    });
-
-    // 6. 网络 task（连接中继 → 注册 → 发送帧 → 接收控制消息）
-    let net_addr = config.server.address.clone();
-    let net_psk = config.device.pre_shared_key.clone();
-    let network_handle = tokio::spawn(async move {
-        let client = match QuicClient::connect(&net_addr, &device_id, &net_psk).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("连接中继失败: {}", e);
-                return;
-            }
-        };
-
-        match client.register().await {
-            Ok(devices) => tracing::info!("注册成功, 在线设备: {:?}", devices),
-            Err(e) => {
-                tracing::error!("注册失败: {}", e);
-                return;
-            }
-        }
-
-        let conn = client.connection.clone();
-
-        // 子 task A：datagram 发送（每个 NAL 单元一个 datagram，带帧序号）
-        let dgram_sender = tokio::spawn(async move {
-            let mut frame_seq: u32 = 0;
-            while let Some(frame) = encode_rx.recv().await {
-                let frame_type = match frame.frame_type {
-                    encoder::FrameType::Keyframe => proto::FrameType::Keyframe as i32,
-                    encoder::FrameType::Delta => proto::FrameType::Delta as i32,
-                };
-                frame_seq += 1;
-
-                let nals: Vec<&[u8]> = split_nal_units(&frame.nal_units)
-                    .into_iter()
-                    .filter(|n| !n.is_empty())
-                    .collect();
-                let total = nals.len() as u32;
-
-                for (idx, nal) in nals.into_iter().enumerate() {
-                    let packet = proto::DataPacket {
-                        frame_type,
-                        display_index: frame.display_index,
-                        payload: nal.to_vec(),
-                        frame_seq,
-                        fragment_index: idx as u32,
-                        fragment_count: total,
-                        ..Default::default()
-                    };
-                    let msg = proto::Message {
-                        r#type: Some(proto::message::Type::DataPacket(packet)),
-                    };
-                    let data = msg.encode_to_vec();
-                    if conn.send_datagram(bytes::Bytes::copy_from_slice(&data)).is_err() {
-                        tracing::warn!("发送 datagram 失败");
-                        return;
-                    }
-                    // 每 20 个 datagram 暂停 1ms，避免 quinn 内部缓冲区溢出丢包
-                    if idx > 0 && idx % 20 == 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                }
-            }
-        });
-
-        // 子 task B：stream 消息接收
-        let conn_clone = client.connection.clone();
-        let kf_tx = keyframe_tx.clone();
-        let stream_receiver = tokio::spawn(async move {
-            loop {
-                match recv_stream_message(&conn_clone).await {
-                    Ok(Some((send, msg))) => {
-                        handle_control_message(&conn_clone, msg, send, &kf_tx).await;
-                    }
-                    Ok(None) => {
-                        tracing::info!("中继连接已关闭");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("接收消息失败: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        let _ = tokio::join!(dgram_sender, stream_receiver);
-        tracing::info!("网络 task 退出");
-    });
-
-    // 7. 等待退出信号
+    // 5. 等待退出信号
     tracing::info!("服务已启动，按 Ctrl+C 停止");
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {}
-        Err(_) => {
-            while running.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        }
-    }
+    tokio::signal::ctrl_c().await.ok();
 
-    // 8. 清理
+    // 6. 停止并等待
     tracing::info!("正在停止服务...");
-    running.store(false, Ordering::SeqCst);
-
-    let _ = capture_handle.join();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), encoder_handle).await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), network_handle).await;
+    capture.stop();
+    encode.stop().await;
+    network.stop().await;
     tracing::info!("服务已停止");
     Ok(())
 }
 
+// ============================================================
+// 编码 task
+// ============================================================
+
+/// 编码 task：消费捕获帧 → H.264 编码 → 输出到 channel。
+async fn encode_task(
+    mut capture_rx: CaptureReceiver,
+    encode_tx: EncodeSender,
+    mut keyframe_rx: mpsc::UnboundedReceiver<()>,
+) {
+    let mut frame_count: u64 = 0;
+    let mut encoder = match encoder::create_best_encoder(1920, 1080, 60) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("编码器初始化失败: {}", e);
+            return;
+        }
+    };
+    tracing::info!("编码器已就绪");
+
+    loop {
+        tokio::select! {
+            result = capture_rx.recv() => {
+                match result {
+                    Some(frame) => {
+                        frame_count += 1;
+                        if frame.cpu_buffer.is_empty() {
+                            continue;
+                        }
+                        match encoder.encode(&frame) {
+                            Ok(encoded_frames) => {
+                                for ef in encoded_frames {
+                                    if encode_tx.send(ef).is_err() {
+                                        tracing::info!("编码输出通道已关闭");
+                                        return;
+                                    }
+                                }
+                                if frame_count % 60 == 1 {
+                                    tracing::info!("帧 #{} 编码完成", frame_count);
+                                }
+                            }
+                            Err(e) => tracing::error!("帧 #{} 编码失败: {}", frame_count, e),
+                        }
+                    }
+                    None => {
+                        tracing::info!("捕获通道已关闭，编码 task 退出，共 {} 帧", frame_count);
+                        return;
+                    }
+                }
+            }
+            Some(_) = keyframe_rx.recv() => {
+                encoder.request_keyframe();
+            }
+        }
+    }
+}
+
+// ============================================================
+// 网络 task
+// ============================================================
+
+/// 网络 task：连接中继 → 注册 → 发送编码帧 → 接收控制消息。
+async fn network_task(
+    server_addr: String,
+    device_id: String,
+    pre_shared_key: String,
+    mut encode_rx: EncodeReceiver,
+    keyframe_tx: KeyFrameSender,
+) {
+    let client = match QuicClient::connect(&server_addr, &device_id, &pre_shared_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("连接中继失败: {}", e);
+            return;
+        }
+    };
+
+    match client.register().await {
+        Ok(devices) => tracing::info!("注册成功, 在线设备: {:?}", devices),
+        Err(e) => {
+            tracing::error!("注册失败: {}", e);
+            return;
+        }
+    }
+
+    let conn = client.connection.clone();
+
+    // 子 task A：datagram 发送
+    let dgram_sender = tokio::spawn(async move {
+        let mut frame_seq: u32 = 0;
+        while let Some(frame) = encode_rx.recv().await {
+            let frame_type = frame.frame_type as i32;
+            frame_seq += 1;
+
+            let nals: Vec<&[u8]> = split_nal_units(&frame.nal_units)
+                .into_iter()
+                .filter(|n| !n.is_empty())
+                .collect();
+            let total = nals.len() as u32;
+
+            for (idx, nal) in nals.into_iter().enumerate() {
+                let packet = proto::DataPacket {
+                    frame_type,
+                    display_index: frame.display_index,
+                    payload: nal.to_vec(),
+                    frame_seq,
+                    fragment_index: idx as u32,
+                    fragment_count: total,
+                    ..Default::default()
+                };
+                let msg = proto::Message {
+                    r#type: Some(proto::message::Type::DataPacket(packet)),
+                };
+                let data = msg.encode_to_vec();
+                if conn.send_datagram(bytes::Bytes::copy_from_slice(&data)).is_err() {
+                    tracing::warn!("发送 datagram 失败");
+                    return;
+                }
+                // 每 20 个 datagram 暂停 1ms，避免 quinn 内部缓冲区溢出丢包
+                if idx > 0 && idx % 20 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+        // encode_rx 已关闭（编码完成），关闭连接以让 stream_receiver 退出
+        tracing::info!("编码通道已关闭，关闭 QUIC 连接");
+        conn.close(0u32.into(), b"shutdown");
+    });
+
+    // 子 task B：stream 消息接收
+    let conn_clone = client.connection.clone();
+    let kf_tx = keyframe_tx.clone();
+    let stream_receiver = tokio::spawn(async move {
+        loop {
+            match recv_stream_message(&conn_clone).await {
+                Ok(Some((send, msg))) => {
+                    handle_control_message(&conn_clone, msg, send, &kf_tx).await;
+                }
+                Ok(None) => {
+                    tracing::info!("中继连接已关闭");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("接收消息失败: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    let _ = tokio::join!(dgram_sender, stream_receiver);
+    tracing::info!("网络 task 退出");
+}
+
+// ============================================================
+// stream 消息收发
+// ============================================================
+
 /// 从 QUIC 连接读取一条 stream 消息，返回 (send half, message)。
-/// send half 可用于回复（如 Pong 响应 Ping）。
 async fn recv_stream_message(
     conn: &quinn::Connection,
 ) -> anyhow::Result<Option<(quinn::SendStream, proto::Message)>> {
@@ -241,7 +386,6 @@ async fn handle_control_message(
     _send: quinn::SendStream,
     keyframe_tx: &KeyFrameSender,
 ) {
-    use prost::Message as _;
     use proto::message::Type;
     match msg.r#type {
         Some(Type::KeyFrameRequest(_)) => {
@@ -255,7 +399,6 @@ async fn handle_control_message(
             tracing::debug!("收到输入事件（暂未处理）");
         }
         Some(Type::Ping(ping)) => {
-            // 开新 stream 回复 Pong（不能用收到的 stream——relay 已关闭其接收端）
             let pong = proto::Message {
                 r#type: Some(Type::Pong(proto::Pong {
                     timestamp_ms: ping.timestamp_ms,
@@ -277,7 +420,7 @@ async fn handle_control_message(
 }
 
 // ============================================================
-// D3D11 设备和捕获循环（不变）
+// D3D11 设备创建
 // ============================================================
 
 fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -299,19 +442,22 @@ fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> 
     Ok((device, context))
 }
 
+// ============================================================
+// 捕获循环
+// ============================================================
+
 fn capture_loop(
-    duplicator: &mut ScreenDuplicator,
+    frame_source: &mut dyn FrameSource,
     tx: mpsc::Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
 ) {
-    let frame_interval = std::time::Duration::from_micros(16667);
+    let frame_interval = Duration::from_micros(16667);
     let mut consecutive_failures: u32 = 0;
     while running.load(Ordering::SeqCst) {
         let frame_start = std::time::Instant::now();
-        match duplicator.acquire_frame(50) {
+        match frame_source.acquire_frame(50) {
             Ok(Some(frame)) => {
                 consecutive_failures = 0;
-                // bounded channel — 编码器跟不上时丢弃旧帧
                 let _ = tx.try_send(frame);
             }
             Ok(None) => {}
@@ -320,7 +466,7 @@ fn capture_loop(
                 tracing::error!("捕获失败 (连续{}次): {}", consecutive_failures, e);
                 if consecutive_failures > 3 {
                     tracing::warn!("重建 duplicator...");
-                    if let Err(e) = duplicator.recreate() {
+                    if let Err(e) = frame_source.recreate() {
                         tracing::error!("重建失败: {}", e);
                         break;
                     }
@@ -332,7 +478,6 @@ fn capture_loop(
         if elapsed < frame_interval {
             std::thread::sleep(frame_interval - elapsed);
         } else if elapsed > Duration::from_millis(200) {
-            // 只在严重超时时警告，避免刷屏阻塞控制台
             tracing::warn!("捕获帧耗时 {:?}（目标 {:?}）", elapsed, frame_interval);
         }
     }
@@ -344,9 +489,6 @@ fn capture_loop(
 // ============================================================
 
 /// 将 Annex B 格式的 H.264 数据按起始码切分为一个个 NAL 单元。
-///
-/// 起始码：0x00 0x00 0x00 0x01（4 字节）或 0x00 0x00 0x01（3 字节）。
-/// 每个 NAL 单元以起始码开头，供解码器独立消费。
 fn split_nal_units(data: &[u8]) -> Vec<&[u8]> {
     if data.is_empty() {
         return vec![];
@@ -357,7 +499,6 @@ fn split_nal_units(data: &[u8]) -> Vec<&[u8]> {
     let len = data.len();
 
     for i in 0..len.saturating_sub(3) {
-        // 4 字节起始码
         if i + 3 < len
             && data[i] == 0x00
             && data[i + 1] == 0x00
@@ -368,9 +509,7 @@ fn split_nal_units(data: &[u8]) -> Vec<&[u8]> {
                 units.push(&data[start..i]);
             }
             start = i;
-        }
-        // 3 字节起始码（与 4 字节不重叠——4 字节已优先匹配）
-        else if data[i] == 0x00
+        } else if data[i] == 0x00
             && data[i + 1] == 0x00
             && data[i + 2] == 0x01
             && (i < 3 || data[i - 1] != 0x00)
@@ -382,7 +521,6 @@ fn split_nal_units(data: &[u8]) -> Vec<&[u8]> {
         }
     }
 
-    // 最后一个 NAL 单元
     if start < len {
         units.push(&data[start..len]);
     }

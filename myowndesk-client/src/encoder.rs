@@ -20,6 +20,7 @@
 //! ```
 
 use crate::capture::CapturedFrame;
+use myowndesk_protocol::FrameType;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
                        RateControlMode, UsageType};
 use openh264::formats::YUVBuffer;
@@ -27,16 +28,6 @@ use openh264::formats::YUVBuffer;
 // ============================================================
 // 数据类型
 // ============================================================
-
-/// 帧类型——映射到 proto `FrameType` 枚举
-///
-/// - `Keyframe` → 可独立解码（IDR / I 帧），用于丢包恢复
-/// - `Delta` → 依赖前面的关键帧（P 帧）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameType {
-    Keyframe = 0,
-    Delta = 1,
-}
 
 /// 编码帧——编码器输出，供网络模块发送（Ticket-05）
 ///

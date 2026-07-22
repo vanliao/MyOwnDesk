@@ -19,7 +19,7 @@
 //!     rgb_tx ──► [gui.rs 渲染]
 //! ```
 
-use crate::encoder::FrameType;
+use myowndesk_protocol::FrameType;
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::formats::YUVSource;
 

@@ -2,6 +2,17 @@
 //!
 //! 通过 `IDXGIOutputDuplication` 以 60fps 捕获主显示器桌面画面，
 //! 输出 BGRA 格式的 D3D11 纹理。
+//!
+//! # 架构
+//!
+//! ```text
+//! FrameSource (trait)
+//!   ├── acquire_frame() → CapturedFrame
+//!   └── recreate()      → 恢复丢失的捕获设备
+//!         │
+//!         ├── ScreenDuplicator (REAL — via DXGI/D3D11)
+//!         └── TestFrameSource (TEST — static images)
+//! ```
 
 use std::time::Instant;
 use windows::core::Interface;
@@ -15,8 +26,69 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::*;
 
 // ============================================================
-// 数据类型
+// FrameSource trait
 // ============================================================
+
+/// 帧源抽象——支持真实 DXGI 捕获和 mock 测试。
+pub trait FrameSource: Send {
+    /// 获取下一帧，返回 `None` 表示超时无新帧。
+    fn acquire_frame(&mut self, timeout_ms: u32) -> anyhow::Result<Option<CapturedFrame>>;
+    /// 重建捕获设备（`DXGI_ERROR_ACCESS_LOST` 后调用）。
+    fn recreate(&mut self) -> anyhow::Result<()>;
+}
+
+// ============================================================
+// TestFrameSource — 用于测试的静态帧源
+// ============================================================
+
+/// 测试用帧源——每次返回一张纯色图像。
+pub struct TestFrameSource {
+    width: u32,
+    height: u32,
+    color: u8,
+    frame_count: u64,
+}
+
+impl TestFrameSource {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height, color: 128, frame_count: 0 }
+    }
+}
+
+impl FrameSource for TestFrameSource {
+    fn acquire_frame(&mut self, _timeout_ms: u32) -> anyhow::Result<Option<CapturedFrame>> {
+        self.frame_count += 1;
+        let pixel_count = (self.width * self.height) as usize;
+        let mut cpu_buffer = vec![self.color; pixel_count * 4];
+        // 每帧轻微变化，模拟画面更新
+        self.color = self.color.wrapping_add(1);
+        // 填充一些图案
+        for y in 0..self.height as usize {
+            for x in 0..self.width as usize {
+                let idx = (y * self.width as usize + x) * 4;
+                cpu_buffer[idx] = (x % 256) as u8;     // B
+                cpu_buffer[idx + 1] = (y % 256) as u8; // G
+                cpu_buffer[idx + 2] = self.color;       // R
+                cpu_buffer[idx + 3] = 255;              // A
+            }
+        }
+        Ok(Some(CapturedFrame {
+            texture: None,
+            cpu_buffer,
+            display_index: 0,
+            timestamp: Instant::now(),
+            width: self.width,
+            height: self.height,
+        }))
+    }
+
+    fn recreate(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+// ============================================================
+// 数据类型
 
 /// 捕获帧——通过 channel 传递给编码器（Ticket-04）
 ///
@@ -286,6 +358,16 @@ impl ScreenDuplicator {
 
         tracing::info!("IDXGIOutputDuplication 重建成功");
         Ok(())
+    }
+}
+
+impl FrameSource for ScreenDuplicator {
+    fn acquire_frame(&mut self, timeout_ms: u32) -> anyhow::Result<Option<CapturedFrame>> {
+        ScreenDuplicator::acquire_frame(self, timeout_ms)
+    }
+
+    fn recreate(&mut self) -> anyhow::Result<()> {
+        ScreenDuplicator::recreate(self)
     }
 }
 

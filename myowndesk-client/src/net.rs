@@ -5,13 +5,16 @@
 //! # 架构
 //!
 //! ```text
-//! QuicClient
-//!   ├── connect(server_addr, device_id, psk) → 建立 QUIC 连接
-//!   ├── register() → 发送 Register 消息，完成 HMAC 认证
-//!   ├── send_datagram(data) → 发送视频帧（不可靠）
-//!   ├── recv_datagram() → 接收视频帧
-//!   ├── send_message(msg) → 发送控制消息（可靠）
-//!   └── recv_message() → 接收控制消息
+//! NetworkClient (trait)
+//!   ├── register() → 注册设备到中继
+//!   ├── request_response() → 请求-响应模式
+//!   ├── send_message() → 发送控制消息（可靠）
+//!   ├── recv_message() → 接收控制消息
+//!   ├── send_datagram() → 发送视频帧（不可靠）
+//!   └── recv_datagram() → 接收视频帧
+//!         │
+//!         ├── QuicClient (REAL — via quinn/QUIC)
+//!         └── MockNetworkClient (TEST — canned responses)
 //! ```
 
 use myowndesk_protocol as proto;
@@ -32,6 +35,41 @@ pub type KeyFrameReceiver = mpsc::UnboundedReceiver<()>;
 /// 接收帧 channel（→ Ticket-06 解码器）
 pub type IncomingFrameSender = mpsc::UnboundedSender<Vec<u8>>;
 pub type IncomingFrameReceiver = mpsc::UnboundedReceiver<Vec<u8>>;
+
+// ============================================================
+// NetworkClient trait
+// ============================================================
+
+/// 客户端网络层抽象——支持真实 QUIC 连接和 mock 测试。
+pub trait NetworkClient: Send + Sync {
+    /// 注册到中继服务器，返回在线设备列表。
+    fn register(&self) -> impl std::future::Future<Output = anyhow::Result<Vec<String>>> + Send;
+
+    /// 发送 protobuf 消息并等待响应（请求-响应模式）。
+    fn request_response(
+        &self,
+        msg: &proto::Message,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<proto::Message>>> + Send;
+
+    /// 在 stream 上发送 protobuf 消息（可靠）。
+    fn send_message(
+        &self,
+        msg: &proto::Message,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// 从 stream 接收 protobuf 消息。
+    fn recv_message(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<proto::Message>>> + Send;
+
+    /// 发送 datagram（视频帧）。
+    fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()>;
+
+    /// 接收 datagram。
+    fn recv_datagram(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send;
+}
 
 // ============================================================
 // QuicClient
@@ -237,6 +275,106 @@ impl QuicClient {
         let msg = proto::Message::decode(payload.as_slice())
             .map_err(|e| anyhow::anyhow!("protobuf 解码失败: {}", e))?;
         Ok(Some(msg))
+    }
+}
+
+impl NetworkClient for QuicClient {
+    async fn register(&self) -> anyhow::Result<Vec<String>> {
+        QuicClient::register(self).await
+    }
+
+    async fn request_response(
+        &self,
+        msg: &proto::Message,
+    ) -> anyhow::Result<Option<proto::Message>> {
+        QuicClient::request_response(self, msg).await
+    }
+
+    async fn send_message(&self, msg: &proto::Message) -> anyhow::Result<()> {
+        QuicClient::send_message(self, msg).await
+    }
+
+    async fn recv_message(&self) -> anyhow::Result<Option<proto::Message>> {
+        QuicClient::recv_message(self).await
+    }
+
+    fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
+        QuicClient::send_datagram(self, data)
+    }
+
+    async fn recv_datagram(&self) -> anyhow::Result<bytes::Bytes> {
+        QuicClient::recv_datagram(self).await
+    }
+}
+
+// ============================================================
+// MockNetworkClient — 用于单元测试
+// ============================================================
+
+use std::sync::Mutex;
+
+/// Mock 网络客户端——注入预设响应，不依赖真实 QUIC 连接。
+pub struct MockNetworkClient {
+    /// 预设注册返回的在线设备列表
+    pub register_result: Mutex<anyhow::Result<Vec<String>>>,
+    /// 预设 request_response 返回的消息
+    pub request_response_result: Mutex<anyhow::Result<Option<proto::Message>>>,
+    /// 已发送的消息（记录调用）
+    pub sent_messages: Mutex<Vec<proto::Message>>,
+    /// 已发送的 datagram（记录调用）
+    pub sent_datagrams: Mutex<Vec<Vec<u8>>>,
+}
+
+impl Default for MockNetworkClient {
+    fn default() -> Self {
+        Self {
+            register_result: Mutex::new(Ok(Vec::new())),
+            request_response_result: Mutex::new(Ok(None)),
+            sent_messages: Mutex::new(Vec::new()),
+            sent_datagrams: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl NetworkClient for MockNetworkClient {
+    async fn register(&self) -> anyhow::Result<Vec<String>> {
+        let guard = self.register_result.lock().unwrap();
+        match &*guard {
+            Ok(devices) => Ok(devices.clone()),
+            Err(e) => Err(anyhow::anyhow!("{}", e)),
+        }
+    }
+
+    async fn request_response(
+        &self,
+        msg: &proto::Message,
+    ) -> anyhow::Result<Option<proto::Message>> {
+        self.sent_messages.lock().unwrap().push(msg.clone());
+        let guard = self.request_response_result.lock().unwrap();
+        match &*guard {
+            Ok(resp) => Ok(resp.clone()),
+            Err(e) => Err(anyhow::anyhow!("{}", e)),
+        }
+    }
+
+    async fn send_message(&self, msg: &proto::Message) -> anyhow::Result<()> {
+        self.sent_messages.lock().unwrap().push(msg.clone());
+        Ok(())
+    }
+
+    async fn recv_message(&self) -> anyhow::Result<Option<proto::Message>> {
+        // 默认返回 None（模拟连接已关闭）
+        Ok(None)
+    }
+
+    fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
+        self.sent_datagrams.lock().unwrap().push(data.to_vec());
+        Ok(())
+    }
+
+    async fn recv_datagram(&self) -> anyhow::Result<bytes::Bytes> {
+        // 一直 pending（模拟空闲连接）
+        std::future::pending().await
     }
 }
 

@@ -158,23 +158,24 @@ async fn handle_connection(
     let stream_device = device_id.clone();
     let stream_conn = connection.clone();
     tokio::spawn(async move {
+        // 读取所有消息：同一 bi-stream 上可发多条消息，减少 stream 创建开销
         loop {
             match stream_conn.accept_bi().await {
-                Ok((send, mut recv)) => {
-                    while let Some(msg) = relay::read_message(&mut recv).await.transpose() {
-                        match msg {
-                            Ok(msg) => {
+                Ok((mut send, mut recv)) => {
+                    loop {
+                        match relay::read_message(&mut recv).await {
+                            Ok(Some(msg)) => {
                                 handle_control_message(
                                     &stream_state,
                                     &stream_device,
                                     msg,
-                                    send,
+                                    &mut send,
                                 )
                                 .await;
-                                // send was consumed by handle_control_message for Pair/Ping,
-                                // need to re-accept for next message
-                                break;
+                                // send 保留（仅 Pair/Ping 写入响应，不 finish），
+                                // 继续读取本条 stream 上的下一条消息
                             }
+                            Ok(None) => break, // stream 正常关闭
                             Err(e) => {
                                 warn!("消息解析失败: {}", e);
                                 break;
@@ -236,7 +237,7 @@ async fn handle_control_message(
     state: &SharedState,
     device_id: &str,
     msg: Message,
-    mut send: quinn::SendStream,
+    send: &mut quinn::SendStream,
 ) {
     match msg.r#type {
         Some(Type::Pair(pair)) => {
@@ -258,7 +259,7 @@ async fn handle_control_message(
             };
 
             let resp = relay::build_pair_response(error_code, error_message);
-            let _ = send_response_on_stream(&mut send, &resp).await;
+            let _ = send_response_on_stream(send, &resp).await;
         }
 
         Some(Type::Disconnect(_)) => {
@@ -293,7 +294,7 @@ async fn handle_control_message(
                     timestamp_ms: ping.timestamp_ms,
                 })),
             };
-            let _ = send_response_on_stream(&mut send, &pong).await;
+            let _ = send_response_on_stream(send, &pong).await;
         }
 
         _ => {
