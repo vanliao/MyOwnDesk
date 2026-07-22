@@ -134,17 +134,21 @@ Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message
 
 ## 06 — 视频解码与渲染
 
-**What to build:** 接收到的 H.264 NAL 单元通过 FFmpeg 软解为 RGB 帧，上传到 D3D11 纹理后在 egui 窗口渲染。
+**What to build:** 接收到的 H.264 NAL 单元通过 openh264 软解为 RGB 帧，minifb 窗口渲染。
 
 **Blocked by:** 01（项目骨架 + 协议定义）
 
-**Status:** ready-for-agent
+**Status:** ✅ done
 
-- [ ] `ffmpeg-next` H.264 软件解码器初始化
-- [ ] NAL 单元 → 解码 → RGB 帧
-- [ ] RGB 帧 → D3D11 纹理（`UpdateSubresource`）
-- [ ] egui 窗口 + 自定义 painter 贴 D3D11 纹理渲染
-- [ ] 处理关键帧到 delta 帧的连续解码
+- [x] `openh264` H.264 软件解码器初始化（与编码器使用同一库）
+- [x] NAL 单元 → 解码 → YUV → RGB 帧
+- [x] `VideoDecoder` trait + `OpenH264Decoder` + `create_best_decoder()` 工厂
+- [x] minifb 窗口渲染（RGB24 → ARGB buffer）
+- [x] 帧重组：按 `frame_seq` 缓存 NAL 单元，完整帧一起送解码器
+- [x] 解码错误恢复：失败后跳过 delta 帧，等下一个 IDR 重建解码器
+- [x] bounded capture channel（容量 2, try_send 丢帧）控制延迟
+- [x] datagram 发送 pacing（每 20 个暂停 1ms）防 quinn 内部丢包
+- [x] 6 个单元测试（解码器创建、IDR 解码、delta 解码、初始化前丢弃、空数据、IDR 检测）
 
 ---
 
@@ -198,6 +202,7 @@ Proto 消息清单（`myowndesk-protocol/src/proto/messages.proto`），`Message
 - [ ] TOML 配置文件读取（server address, device id, pre-shared key）
 - [ ] 本地 TCP 连接后台服务（127.0.0.1），获取状态和在线列表
 - [ ] 错误提示（连接失败、认证失败、设备不在线）
+- [ ] **T06 遗留**：配对时序导致首帧延迟 ~3-5s。GUI 配对时 service 已编码多帧，配对前的 datagram 被 relay 丢弃，需等 KeyFrameRequest 往返 + 编码器重建。修复方向：① GUI 配对后 service 侧清空编码器再重建（减少等待）② 或者 relay 缓存配对前 N 帧（内存换延迟）③ 或者 GUI 连接时预先指定目标设备一起注册，注册成功即配对，省一次 round-trip
 
 ---
 

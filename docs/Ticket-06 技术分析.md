@@ -692,12 +692,159 @@ mod tests {
 
 ---
 
+---
+
+## 实现过程中的问题与解决
+
+### 1. ffmpeg-next 依赖无法获取
+
+**现象**：`ffmpeg-next-sys` 从 Rust 镜像获取失败，`bindgen` 构建脚本被 AV 拦截。
+
+**解决**：改用 `openh264` 的解码器（与编码器同一 crate），无需额外依赖。AV 环境无法运行构建脚本，openh264 的 C 库通过 `source` feature 源码编译不依赖 bindgen。
+
+参考：T04 编码器也因同样原因从 ffmpeg-next 切换到 openh264。
+
+---
+
+### 2. egui / wgpu 构建失败
+
+**现象**：`egui-wgpu` → `wgpu` → `wgpu-hal` → `khronos_api` 构建脚本被 AV 拦截，`aws-lc-rs` 需要 cmake（环境缺失）。
+
+**解决**：放弃 egui/wgpu，改用 `minifb`（纯 Windows API 帧缓冲窗口，零额外构建依赖）。egui 完整 UI 推迟到 T09。
+
+---
+
+### 3. rustls aws-lc-rs → ring
+
+**现象**：`rustls` 0.23 默认 crypto provider `aws-lc-rs` 依赖 cmake 编译，构建失败。
+
+**解决**：切换为 `ring` crypto provider：
+```toml
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+```
+同时修复 `net.rs` 中 `rustls::crypto::aws_lc_rs::default_provider()` → `rustls::crypto::ring::default_provider()`。
+
+---
+
+### 4. D3D11CreateDevice 参数错误
+
+**现象**：`E_INVALIDARG (0x80070057)` — `D3D_DRIVER_TYPE_UNKNOWN(0)` 不是 `D3D11CreateDevice` 的合法参数。
+
+**解决**：`D3D_DRIVER_TYPE_UNKNOWN` → `D3D_DRIVER_TYPE_HARDWARE`。`UNKNOWN` 是给其他 D3D 函数用的。
+
+---
+
+### 5. QuicClient 协议层 bug：send_message + recv_message 分不同 stream
+
+**现象**：`register()` 和 `Pair` 永远卡住——relay 在同一条 bi-stream 上回复响应，但 `QuicClient` 把发送和接收分到两条不同的 stream。
+
+**根因**：
+```rust
+// relay: 在同一条 bi-stream 上回复
+let (mut send, mut recv) = conn.open_bi().await?;
+send_frame(&mut send, &msg).await;     // 发 Register
+let resp = read_message(&mut recv);    // 在同一条 stream 收 RegisterResponse!
+
+// QuicClient: send/recv 用不同的 stream
+send_message() → open stream A → send → discard A
+recv_message() → accept NEW stream B → 永远等不到
+```
+
+**解决**：新增 `QuicClient::request_response()` 方法，在同一条 bi-stream 上发请求、收响应。`register()` 和 `Pair` 改用此方法。`recv_message()` 保留用于 relay 主动推送的消息（Ping、PeerDisconnected）。
+
+---
+
+### 6. Ping/Pong 心跳——service 回复丢失
+
+**现象**：连接 30 秒后 relay 断开设备——relay 发 Ping，service 在同一条 stream 回复 Pong，但 relay 不读回复。
+
+**根因**：relay 的 Ping 任务用 `send_message()` 发 Ping 后立即关闭 stream，不等待响应。service 在同一 stream 写的 Pong 被丢弃。
+
+**解决**：service 收到 Ping 后**新开一条 bi-stream** 回复 Pong，relay 的 stream reader 正常读取并更新心跳。GUI 同样修复。
+
+---
+
+### 7. force_intra_frame 在 ScreenContentRealTime 下不可靠
+
+**现象**：GUI 发 KeyFrameRequest 后 20-30 秒才出现首帧。
+
+**根因**：
+1. `force_intra_frame()` 在 ScreenContentRealTime 模式下可能被忽略
+2. 即使生效，Skip 帧也会消耗 `force_keyframe` 标志（已修复：Skip 后保留标志）
+3. 但即便修复了标志消费问题，`ForceIntraFrame` 在静态屏幕内容下仍不一定产出 IDR
+
+**解决**：收到 KeyFrameRequest 后直接**重建编码器**（`create_encoder()`），新编码器的首帧必为 IDR。同时码率从 15Mbps 降至 8Mbps，减小 keyframe 体积。
+
+---
+
+### 8. 帧堆积导致延迟（unbounded channel + 下游卡顿）
+
+**现象**：画面延迟逐渐增大，最终卡死——帧在 unbounded channel 越积越多。
+
+**根因**：
+1. 渲染循环逐帧做 ARGB 转换——队列中有 100 帧就转换 100 次，拖慢 render loop
+2. 下游慢导致上游不阻塞（unbounded），帧继续堆积
+3. 尝试 bounded channel 又导致死锁（下游卡住→上游全卡）
+
+**解决**：
+- 渲染循环**跳过中间帧**的 ARGB 转换，只取最后帧
+- `capture_tx` 用 bounded channel（容量 2，`try_send` 丢帧）从源头控制延迟
+- 下游 channel 保持 unbounded 避免死锁
+- 解码错误后进入恢复模式：跳过 delta 帧直到下一个 IDR，重建解码器
+
+---
+
+### 9. datagram 内部丢包（quinn 静默丢弃）
+
+**现象**：关键帧 ~200 个 datagram 在 tight loop 中发送，quinn 内部缓冲溢出后静默丢包（`.ok()` 调用），导致帧组装不完整、解码失败。
+
+**解决**：
+1. 每 20 个 datagram 暂停 1ms（pacing），给 quinn 内部发送时间
+2. 码率降至 8Mbps，keyframe 体积 ~28KB（vs 之前 240KB），datagram 数大大减少
+
+---
+
+### 10. 控制台日志阻塞
+
+**现象**：service 每帧都输出 `捕获帧耗时` warn（~15 条/秒），Windows 控制台刷屏阻塞整个进程。
+
+**解决**：只在耗时 >200ms 时才输出警告。
+
+---
+
+### 11. GUI 重连 relay 状态残留
+
+**现象**：关闭 GUI 后立即重启，Pair 失败或连接 idle timeout。
+
+**根因**：relay idle timeout 默认 30s，旧 GUI 连接死亡后要等 30s 才清理配对状态。
+
+**解决**：relay 和 client 两端加 keep-alive（3s 心跳，10s idle timeout），快速检测死连接并清理。
+
+---
+
+### 12. 配对时序导致首帧延迟（T06 未完全解决，记入 T09）
+
+**现象**：GUI 启动后 3-5 秒才出现首帧画面。
+
+**根因**：
+1. GUI 配对时 service 已编码多帧，配对前的 datagram 被 relay 丢弃（未配对状态）
+2. 需等 KeyFrameRequest 往返 + 编码器重建
+3. 编码器 task 中 `tokio::select!` 先处理已缓存的帧才能轮到 keyframe 信号
+
+**修复方向（记入 T09）**：
+- ① GUI 配对后 service 侧立刻清空并重建编码器
+- ② relay 缓存配对前 N 帧（内存换延迟）
+- ③ GUI 注册时预指定目标设备，注册即配对，省一次 round-trip
+
+---
+
 ## 后续扩展路径
 
 | 扩展 | 说明 |
 |------|------|
 | DXVA2 硬解 | 新增 `Dxva2Decoder` 实现 `VideoDecoder` trait，解码帧直接输出 D3D11 纹理（零拷贝） |
 | 设备列表 UI | Ticket-09 替换硬编码目标设备 ID |
-| 流畅度优化 | 渲染侧做帧队列 + 计时器均匀显示，而非简单的 " 取最新帧 " |
+| egui 集成 | 从 minifb 切换到 egui，实现完整 GUI |
+| 流畅度优化 | 渲染侧做帧队列 + 计时器均匀显示 |
 | 多分辨率适配 | 被控端分辨率 ≠ 窗口大小时的高质量缩放 |
 | 画面黑边处理 | 保持宽高比的 letterbox / pillarbox 显示 |
