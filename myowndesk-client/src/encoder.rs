@@ -118,7 +118,7 @@ impl OpenH264Encoder {
     pub fn new(width: u32, height: u32, fps: u32) -> anyhow::Result<Self> {
         let encoder = Self::create_encoder(fps)?;
         tracing::info!(
-            "OpenH264 编码器已初始化: {}x{} @ {}fps, CBR 15Mbps, 屏幕实时模式",
+            "OpenH264 编码器已初始化: {}x{} @ {}fps, CBR 8Mbps, 屏幕实时模式",
             width, height, fps,
         );
         Ok(Self {
@@ -154,6 +154,7 @@ impl OpenH264Encoder {
 impl VideoEncoder for OpenH264Encoder {
     fn encode(&mut self, frame: &CapturedFrame) -> anyhow::Result<Vec<EncodedFrame>> {
         self.frame_count += 1;
+        let t_total = std::time::Instant::now();
 
         // 0. 如果请求了重建编码器，直接创建新实例（第一帧必为 IDR）
         if self.reset_requested {
@@ -164,7 +165,9 @@ impl VideoEncoder for OpenH264Encoder {
         }
 
         // 1. 转换 BGRA → YUV420P
+        let t0 = std::time::Instant::now();
         let yuv = bgra_to_yuv420p(&frame.cpu_buffer, frame.width as usize, frame.height as usize);
+        let convert_us = t0.elapsed().as_micros();
 
         // 2. 如果需要关键帧，在编码前设置标志（不提前消费——Skip 帧不消耗）
         if self.force_keyframe {
@@ -172,9 +175,11 @@ impl VideoEncoder for OpenH264Encoder {
         }
 
         // 3. 编码
+        let t1 = std::time::Instant::now();
         let bitstream = self.encoder
             .encode(&yuv)
             .map_err(|e| anyhow::anyhow!("openh264 编码帧 #{} 失败: {}", self.frame_count, e))?;
+        let encode_us = t1.elapsed().as_micros();
 
         let raw_frame_type = bitstream.frame_type();
 
@@ -213,12 +218,29 @@ impl VideoEncoder for OpenH264Encoder {
             height: frame.height,
         };
 
+        let total_us = t_total.elapsed().as_micros();
+        let total_ms = total_us as f64 / 1000.0;
+        let convert_ms = convert_us as f64 / 1000.0;
+        let encode_ms = encode_us as f64 / 1000.0;
         if self.frame_count % 60 == 1 {
             tracing::info!(
-                "编码帧 #{}: {} ({} bytes)",
+                "编码帧 #{}: {} ({} bytes, conv={:.1}ms encode={:.1}ms total={:.1}ms)",
                 self.frame_count,
                 if is_keyframe { "KEYFRAME" } else { "DELTA" },
                 encoded_frame.nal_units.len(),
+                convert_ms,
+                encode_ms,
+                total_ms,
+            );
+        } else if self.frame_count % 10 == 1 {
+            tracing::info!(
+                "编码帧 #{}: {} ({} bytes, conv={:.1}ms encode={:.1}ms total={:.1}ms)",
+                self.frame_count,
+                if is_keyframe { "KEYFRAME" } else { "DELTA" },
+                encoded_frame.nal_units.len(),
+                convert_ms,
+                encode_ms,
+                total_ms,
             );
         }
 
@@ -236,6 +258,17 @@ impl VideoEncoder for OpenH264Encoder {
 // 颜色空间转换：BGRA → YUV420P (I420)
 // ============================================================
 
+/// BT.601 整数系数（取整到 256 倍，用右移 8 位代替浮点）
+const Y_R: i32 = 77;   // 0.299 * 256
+const Y_G: i32 = 150;  // 0.587 * 256
+const Y_B: i32 = 29;   // 0.114 * 256
+const U_R: i32 = -43;  // -0.169 * 256
+const U_G: i32 = -85;  // -0.331 * 256
+const U_B: i32 = 128;  // 0.500 * 256
+const V_R: i32 = 128;  // 0.500 * 256
+const V_G: i32 = -107; // -0.419 * 256
+const V_B: i32 = -21;  // -0.081 * 256
+
 /// 将 BGRA 像素数据转换为 YUV420P (I420) 格式。
 ///
 /// YUV420P 平面布局：
@@ -244,41 +277,51 @@ impl VideoEncoder for OpenH264Encoder {
 /// - V 平面: (width/2) × (height/2) 字节
 /// - 总大小: width * height * 3 / 2
 ///
-/// 使用 BT.601 标准转换公式。
+/// 使用整数 BT.601 近似（零浮点、零分支关键路径）。
 fn bgra_to_yuv420p(bgra: &[u8], width: usize, height: usize) -> YUVBuffer {
     let total_size = width * height * 3 / 2;
     let mut yuv = vec![0u8; total_size];
 
-    let y_plane_size = width * height;
-    let u_plane_size = (width / 2) * (height / 2);
+    let (y_plane, rest) = yuv.split_at_mut(width * height);
+    let uv_w = width / 2;
+    let (u_plane, v_plane) = rest.split_at_mut(uv_w * (height / 2));
 
-    // 使用 split_at_mut 获取三个互不重叠的可变切片
-    let (y_plane, rest) = yuv.split_at_mut(y_plane_size);
-    let (u_plane, v_plane) = rest.split_at_mut(u_plane_size);
+    // 按 2x2 块处理：4 个像素共享一对 UV
+    for y in (0..height).step_by(2) {
+        let y_next = (y + 1).min(height - 1);
+        let row0 = y * width;
+        let row1 = y_next * width;
 
-    // 填充 Y 平面并收集 UV 采样
-    // BGRA 像素布局: bgra[offset+0]=B, bgra[offset+1]=G, bgra[offset+2]=R, bgra[offset+3]=A
-    for y in 0..height {
-        for x in 0..width {
-            let offset = (y * width + x) * 4;
-            let b = bgra[offset] as f32;
-            let g = bgra[offset + 1] as f32;
-            let r = bgra[offset + 2] as f32;
+        for x in (0..width).step_by(2) {
+            let x_next = (x + 1).min(width - 1);
 
-            // Y 分量 (全分辨率)
-            let y_val = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
-            y_plane[y * width + x] = y_val;
+            // 直接索引 4 个 BGRA 像素（无循环、无分支）
+            let off_tl = (row0 + x) * 4;
+            let off_tr = (row0 + x_next) * 4;
+            let off_bl = (row1 + x) * 4;
+            let off_br = (row1 + x_next) * 4;
 
-            // U/V 分量 (2x2 下采样)
-            if x % 2 == 0 && y % 2 == 0 {
-                let u_idx = (y / 2) * (width / 2) + (x / 2);
-                if u_idx < u_plane_size {
-                    let u_val = (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).round() as u8;
-                    let v_val = (0.500 * r - 0.419 * g - 0.081 * b + 128.0).round() as u8;
-                    u_plane[u_idx] = u_val;
-                    v_plane[u_idx] = v_val;
-                }
-            }
+            let b0 = bgra[off_tl] as i32; let g0 = bgra[off_tl + 1] as i32; let r0 = bgra[off_tl + 2] as i32;
+            let b1 = bgra[off_tr] as i32; let g1 = bgra[off_tr + 1] as i32; let r1 = bgra[off_tr + 2] as i32;
+            let b2 = bgra[off_bl] as i32; let g2 = bgra[off_bl + 1] as i32; let r2 = bgra[off_bl + 2] as i32;
+            let b3 = bgra[off_br] as i32; let g3 = bgra[off_br + 1] as i32; let r3 = bgra[off_br + 2] as i32;
+
+            // Y = (77*R + 150*G + 29*B + 128) >> 8
+            y_plane[row0 + x] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + 128) >> 8) as u8;
+            y_plane[row0 + x_next] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + 128) >> 8) as u8;
+            y_plane[row1 + x] = ((Y_R * r2 + Y_G * g2 + Y_B * b2 + 128) >> 8) as u8;
+            y_plane[row1 + x_next] = ((Y_R * r3 + Y_G * g3 + Y_B * b3 + 128) >> 8) as u8;
+
+            // UV 用 2x2 块平均色
+            let avg_r = (r0 + r1 + r2 + r3) >> 2;
+            let avg_g = (g0 + g1 + g2 + g3) >> 2;
+            let avg_b = (b0 + b1 + b2 + b3) >> 2;
+
+            let u_idx = (y >> 1) * uv_w + (x >> 1);
+            // U = ((-43*R - 85*G + 128*B + 128) >> 8) + 128
+            u_plane[u_idx] = (((U_R * avg_r + U_G * avg_g + U_B * avg_b + 128) >> 8) + 128) as u8;
+            // V = ((128*R - 107*G - 21*B + 128) >> 8) + 128
+            v_plane[u_idx] = (((V_R * avg_r + V_G * avg_g + V_B * avg_b + 128) >> 8) + 128) as u8;
         }
     }
 
