@@ -204,11 +204,34 @@ pub async fn run() -> anyhow::Result<()> {
 // ============================================================
 
 /// 编码 task：消费捕获帧 → H.264 编码 → 输出到 channel。
+///
+/// 分两个阶段：
+/// 1. 等待配对：收到首次 KeyFrameRequest 前，丢弃所有捕获帧（不浪费 CPU 编码）
+/// 2. 正常编码：收到 KeyFrameRequest 后创建编码器开始编码
 async fn encode_task(
     mut capture_rx: CaptureReceiver,
     encode_tx: EncodeSender,
     mut keyframe_rx: mpsc::UnboundedReceiver<()>,
 ) {
+    // ---- 阶段 1：等待配对信号 ----
+    tracing::info!("编码器等待配对信号...");
+    loop {
+        tokio::select! {
+            Some(_) = keyframe_rx.recv() => {
+                tracing::info!("收到配对信号，创建编码器");
+                break;
+            }
+            Some(_) = capture_rx.recv() => {
+                // 配对前丢弃捕获帧，不浪费 CPU 编码
+            }
+            else => {
+                tracing::info!("编码 task 退出（未配对通道已关闭）");
+                return;
+            }
+        }
+    }
+
+    // ---- 阶段 2：正常编码 ----
     let mut frame_count: u64 = 0;
     let mut encoder = match encoder::create_best_encoder(1920, 1080, 60) {
         Ok(e) => e,
@@ -219,6 +242,7 @@ async fn encode_task(
     };
     tracing::info!("编码器已就绪");
 
+    // 首次 KeyFrameRequest 已消费，继续监听后续 keyframe 信号
     loop {
         tokio::select! {
             result = capture_rx.recv() => {
