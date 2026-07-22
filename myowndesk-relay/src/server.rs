@@ -18,10 +18,16 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
     // 生成自签名证书
     let cert = generate_self_signed_cert()?;
 
-    let server_config =
+    let mut transport = quinn::TransportConfig::default();
+    // 10s idle 超时，快速检测死连接
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::from(quinn::VarInt::from_u32(10_000)),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(3)));
+
+    let mut server_config =
         quinn::ServerConfig::with_single_cert(cert.certs, cert.key)?;
-    // 允许客户端不验证证书（自签名场景）
-    // TransportConfig 默认参数即可
+    server_config.transport_config(Arc::new(transport));
 
     let addr: SocketAddr = config.listen_address.parse()?;
     let endpoint = quinn::Endpoint::server(server_config, addr)?;

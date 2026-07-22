@@ -11,10 +11,11 @@ use myowndesk_protocol as proto;
 use prost::Message as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_SDK_VERSION, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -42,8 +43,8 @@ pub async fn run() -> anyhow::Result<()> {
     let (device, context) = create_d3d11_device()?;
     let mut duplicator = ScreenDuplicator::new(&device, &context)?;
 
-    // 3. 创建通道
-    let (capture_tx, mut capture_rx) = mpsc::unbounded_channel::<CapturedFrame>();
+    // 3. 创建通道（bounded 容量 2 防止帧堆积导致延迟）
+    let (capture_tx, mut capture_rx) = mpsc::channel::<CapturedFrame>(2);
     let (encode_tx, mut encode_rx) = mpsc::unbounded_channel::<EncodedFrame>();
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<()>();
     let running = Arc::new(AtomicBool::new(true));
@@ -121,25 +122,44 @@ pub async fn run() -> anyhow::Result<()> {
 
         let conn = client.connection.clone();
 
-        // 子 task A：datagram 发送
+        // 子 task A：datagram 发送（每个 NAL 单元一个 datagram，带帧序号）
         let dgram_sender = tokio::spawn(async move {
+            let mut frame_seq: u32 = 0;
             while let Some(frame) = encode_rx.recv().await {
-                let packet = proto::DataPacket {
-                    frame_type: match frame.frame_type {
-                        encoder::FrameType::Keyframe => proto::FrameType::Keyframe as i32,
-                        encoder::FrameType::Delta => proto::FrameType::Delta as i32,
-                    },
-                    display_index: frame.display_index,
-                    payload: frame.nal_units,
-                    ..Default::default()
+                let frame_type = match frame.frame_type {
+                    encoder::FrameType::Keyframe => proto::FrameType::Keyframe as i32,
+                    encoder::FrameType::Delta => proto::FrameType::Delta as i32,
                 };
-                let msg = proto::Message {
-                    r#type: Some(proto::message::Type::DataPacket(packet)),
-                };
-                let data = msg.encode_to_vec();
-                if conn.send_datagram(bytes::Bytes::copy_from_slice(&data)).is_err() {
-                    tracing::warn!("发送 datagram 失败");
-                    break;
+                frame_seq += 1;
+
+                let nals: Vec<&[u8]> = split_nal_units(&frame.nal_units)
+                    .into_iter()
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                let total = nals.len() as u32;
+
+                for (idx, nal) in nals.into_iter().enumerate() {
+                    let packet = proto::DataPacket {
+                        frame_type,
+                        display_index: frame.display_index,
+                        payload: nal.to_vec(),
+                        frame_seq,
+                        fragment_index: idx as u32,
+                        fragment_count: total,
+                        ..Default::default()
+                    };
+                    let msg = proto::Message {
+                        r#type: Some(proto::message::Type::DataPacket(packet)),
+                    };
+                    let data = msg.encode_to_vec();
+                    if conn.send_datagram(bytes::Bytes::copy_from_slice(&data)).is_err() {
+                        tracing::warn!("发送 datagram 失败");
+                        return;
+                    }
+                    // 每 20 个 datagram 暂停 1ms，避免 quinn 内部缓冲区溢出丢包
+                    if idx > 0 && idx % 20 == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                 }
             }
         });
@@ -150,7 +170,9 @@ pub async fn run() -> anyhow::Result<()> {
         let stream_receiver = tokio::spawn(async move {
             loop {
                 match recv_stream_message(&conn_clone).await {
-                    Ok(Some(msg)) => handle_control_message(msg, &kf_tx),
+                    Ok(Some((send, msg))) => {
+                        handle_control_message(&conn_clone, msg, send, &kf_tx).await;
+                    }
                     Ok(None) => {
                         tracing::info!("中继连接已关闭");
                         break;
@@ -189,9 +211,12 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 从 QUIC 连接读取一条 stream 消息（4 字节 LE 长度前缀 + protobuf）
-async fn recv_stream_message(conn: &quinn::Connection) -> anyhow::Result<Option<proto::Message>> {
-    let (_send, mut recv) = conn.accept_bi().await?;
+/// 从 QUIC 连接读取一条 stream 消息，返回 (send half, message)。
+/// send half 可用于回复（如 Pong 响应 Ping）。
+async fn recv_stream_message(
+    conn: &quinn::Connection,
+) -> anyhow::Result<Option<(quinn::SendStream, proto::Message)>> {
+    let (send, mut recv) = conn.accept_bi().await?;
     let mut len_buf = [0u8; 4];
     match AsyncReadExt::read_exact(&mut recv, &mut len_buf).await {
         Ok(_) => {}
@@ -206,26 +231,43 @@ async fn recv_stream_message(conn: &quinn::Connection) -> anyhow::Result<Option<
     recv.read_exact(&mut payload).await?;
     let msg = proto::Message::decode(payload.as_slice())
         .map_err(|e| anyhow::anyhow!("protobuf 解码失败: {}", e))?;
-    Ok(Some(msg))
+    Ok(Some((send, msg)))
 }
 
-/// 处理从中继接收的控制消息
-fn handle_control_message(msg: proto::Message, keyframe_tx: &KeyFrameSender) {
+/// 处理从中继接收的控制消息。
+async fn handle_control_message(
+    conn: &quinn::Connection,
+    msg: proto::Message,
+    _send: quinn::SendStream,
+    keyframe_tx: &KeyFrameSender,
+) {
+    use prost::Message as _;
     use proto::message::Type;
     match msg.r#type {
         Some(Type::KeyFrameRequest(_)) => {
+            tracing::info!("收到 KeyFrameRequest，通知编码器");
             let _ = keyframe_tx.send(());
         }
         Some(Type::PeerDisconnected(pd)) => {
             tracing::warn!("对端已断开: {}", pd.reason);
-            // TODO: Ticket-11 触发锁屏
         }
         Some(Type::KeyEvent(_)) | Some(Type::MouseEvent(_)) => {
             tracing::debug!("收到输入事件（暂未处理）");
-            // TODO: Ticket-08 输入注入
         }
-        Some(Type::Ping(_)) => {
-            tracing::debug!("收到 Ping");
+        Some(Type::Ping(ping)) => {
+            // 开新 stream 回复 Pong（不能用收到的 stream——relay 已关闭其接收端）
+            let pong = proto::Message {
+                r#type: Some(Type::Pong(proto::Pong {
+                    timestamp_ms: ping.timestamp_ms,
+                })),
+            };
+            let payload = pong.encode_to_vec();
+            let len = (payload.len() as u32).to_le_bytes();
+            if let Ok((mut s, _r)) = conn.open_bi().await {
+                let _ = s.write_all(&len).await;
+                let _ = s.write_all(&payload).await;
+                let _ = s.finish();
+            }
         }
         Some(other) => {
             tracing::debug!("未处理消息: {:?}", other);
@@ -246,7 +288,7 @@ fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> 
     let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     unsafe {
         D3D11CreateDevice(
-            None, D3D_DRIVER_TYPE_UNKNOWN, None, flags,
+            None, D3D_DRIVER_TYPE_HARDWARE, None, flags,
             Some(&feature_levels), D3D11_SDK_VERSION,
             Some(&mut device), Some(&mut feature_level), Some(&mut context),
         ).map_err(|e| anyhow::anyhow!("D3D11CreateDevice 失败: {}", e))?;
@@ -259,7 +301,7 @@ fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> 
 
 fn capture_loop(
     duplicator: &mut ScreenDuplicator,
-    tx: mpsc::UnboundedSender<CapturedFrame>,
+    tx: mpsc::Sender<CapturedFrame>,
     running: Arc<AtomicBool>,
 ) {
     let frame_interval = std::time::Duration::from_micros(16667);
@@ -269,7 +311,8 @@ fn capture_loop(
         match duplicator.acquire_frame(50) {
             Ok(Some(frame)) => {
                 consecutive_failures = 0;
-                if tx.send(frame).is_err() { break; }
+                // bounded channel — 编码器跟不上时丢弃旧帧
+                let _ = tx.try_send(frame);
             }
             Ok(None) => {}
             Err(e) => {
@@ -288,9 +331,61 @@ fn capture_loop(
         let elapsed = frame_start.elapsed();
         if elapsed < frame_interval {
             std::thread::sleep(frame_interval - elapsed);
-        } else if elapsed > frame_interval * 2 {
+        } else if elapsed > Duration::from_millis(200) {
+            // 只在严重超时时警告，避免刷屏阻塞控制台
             tracing::warn!("捕获帧耗时 {:?}（目标 {:?}）", elapsed, frame_interval);
         }
     }
     tracing::info!("捕获循环退出");
+}
+
+// ============================================================
+// NAL 单元切分（Annex B 起始码分割）
+// ============================================================
+
+/// 将 Annex B 格式的 H.264 数据按起始码切分为一个个 NAL 单元。
+///
+/// 起始码：0x00 0x00 0x00 0x01（4 字节）或 0x00 0x00 0x01（3 字节）。
+/// 每个 NAL 单元以起始码开头，供解码器独立消费。
+fn split_nal_units(data: &[u8]) -> Vec<&[u8]> {
+    if data.is_empty() {
+        return vec![];
+    }
+
+    let mut units = Vec::new();
+    let mut start = 0usize;
+    let len = data.len();
+
+    for i in 0..len.saturating_sub(3) {
+        // 4 字节起始码
+        if i + 3 < len
+            && data[i] == 0x00
+            && data[i + 1] == 0x00
+            && data[i + 2] == 0x00
+            && data[i + 3] == 0x01
+        {
+            if start < i && i > 0 {
+                units.push(&data[start..i]);
+            }
+            start = i;
+        }
+        // 3 字节起始码（与 4 字节不重叠——4 字节已优先匹配）
+        else if data[i] == 0x00
+            && data[i + 1] == 0x00
+            && data[i + 2] == 0x01
+            && (i < 3 || data[i - 1] != 0x00)
+        {
+            if start < i && i > 0 {
+                units.push(&data[start..i]);
+            }
+            start = i;
+        }
+    }
+
+    // 最后一个 NAL 单元
+    if start < len {
+        units.push(&data[start..len]);
+    }
+
+    units
 }

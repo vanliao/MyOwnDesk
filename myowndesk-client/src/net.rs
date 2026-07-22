@@ -72,14 +72,19 @@ impl QuicClient {
             .parse()
             .map_err(|e| anyhow::anyhow!("服务器地址格式错误 '{}': {}", server_addr, e))?;
 
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::from(quinn::VarInt::from_u32(10_000)),
+        ));
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(3)));
+
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+        ));
+        client_config.transport_config(Arc::new(transport));
+
         let connection = endpoint
-            .connect_with(
-                quinn::ClientConfig::new(Arc::new(
-                    quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
-                )),
-                addr,
-                "myowndesk",
-            )?
+            .connect_with(client_config, addr, "myowndesk")?
             .await?;
 
         tracing::info!(
@@ -110,8 +115,8 @@ impl QuicClient {
             })),
         };
 
-        self.send_message(&msg).await?;
-        let resp = self.recv_message().await?;
+        // Register 是请求-响应：在同一条 bi-stream 上发请求、收响应
+        let resp = self.request_response(&msg).await?;
 
         match resp.and_then(|m| m.r#type) {
             Some(proto::message::Type::RegisterResponse(r)) => {
@@ -131,6 +136,47 @@ impl QuicClient {
                 other.map(|t| format!("{:?}", t))
             )),
         }
+    }
+
+    /// 发送一条 protobuf 消息并等待响应（请求-响应模式）。
+    ///
+    /// 在同一条 bi-stream 上发送请求、接收响应。
+    /// relay 在收到请求的 stream 上回复响应，而不是打开新 stream。
+    ///
+    /// 返回 `None` 表示 stream 关闭（对端断开）。
+    pub async fn request_response(
+        &self,
+        msg: &proto::Message,
+    ) -> anyhow::Result<Option<proto::Message>> {
+        use tokio::io::AsyncReadExt;
+
+        let payload = msg.encode_to_vec();
+        let len = (payload.len() as u32).to_le_bytes();
+
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        send.write_all(&len).await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        // 从同一条 stream 读取响应
+        let mut len_buf = [0u8; 4];
+        match AsyncReadExt::read_exact(&mut recv, &mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(anyhow::anyhow!("读取消息失败: {}", e)),
+        }
+
+        let msg_len = u32::from_le_bytes(len_buf) as usize;
+        if msg_len > 16 * 1024 * 1024 {
+            anyhow::bail!("消息长度超过 16MB 上限");
+        }
+
+        let mut payload = vec![0u8; msg_len];
+        recv.read_exact(&mut payload).await?;
+
+        let msg = proto::Message::decode(payload.as_slice())
+            .map_err(|e| anyhow::anyhow!("protobuf 解码失败: {}", e))?;
+        Ok(Some(msg))
     }
 
     /// 发送 datagram（视频帧）。
@@ -262,7 +308,7 @@ fn build_skip_verify_tls_config() -> anyhow::Result<rustls::ClientConfig> {
         }
     }
 
-    let crypto_provider = rustls::crypto::aws_lc_rs::default_provider();
+    let crypto_provider = rustls::crypto::ring::default_provider();
     let config = rustls::ClientConfig::builder_with_provider(crypto_provider.into())
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow::anyhow!("TLS 版本配置失败: {}", e))?

@@ -11,8 +11,8 @@ async fn main() -> anyhow::Result<()> {
             println!("[uninstall] 服务卸载功能将在后续实现");
         }
         _ => {
-            println!("[gui] GUI 模式启动中...");
-            // TODO: Ticket-06 / Ticket-09
+            // Ticket-06: GUI 模式——硬编码直连版本
+            myowndesk_client::gui::run().await?;
         }
     }
     Ok(())

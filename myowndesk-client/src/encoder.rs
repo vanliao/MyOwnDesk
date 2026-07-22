@@ -109,21 +109,33 @@ pub struct OpenH264Encoder {
     height: u32,
     fps: u32,
     force_keyframe: bool,
+    reset_requested: bool,
     frame_count: u64,
 }
 
 impl OpenH264Encoder {
     /// 创建 OpenH264 软编。
-    ///
-    /// 配置参数：
-    /// - 码率控制：CBR 15 Mbps
-    /// - 帧率：60 fps
-    /// - GOP：60 帧（每 60 帧一个 IDR）
-    /// - Usage: `ScreenContentRealTime`（屏幕实时内容优化）
-    /// - max_slice_len: 1200（适配 MTU，Slice Mode）
     pub fn new(width: u32, height: u32, fps: u32) -> anyhow::Result<Self> {
+        let encoder = Self::create_encoder(fps)?;
+        tracing::info!(
+            "OpenH264 编码器已初始化: {}x{} @ {}fps, CBR 15Mbps, 屏幕实时模式",
+            width, height, fps,
+        );
+        Ok(Self {
+            encoder,
+            width,
+            height,
+            fps,
+            force_keyframe: false,
+            reset_requested: false,
+            frame_count: 0,
+        })
+    }
+
+    /// 创建编码器实例（公开用于重建）。
+    fn create_encoder(fps: u32) -> anyhow::Result<Encoder> {
         let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(15_000_000))
+            .bitrate(BitRate::from_bps(8_000_000))
             .max_frame_rate(FrameRate::from_hz(fps as f32))
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
@@ -131,24 +143,11 @@ impl OpenH264Encoder {
             .max_slice_len(1200)
             .num_threads(4);
 
-        let encoder = Encoder::with_api_config(
+        Encoder::with_api_config(
             openh264::OpenH264API::from_source(),
             config,
-        ).map_err(|e| anyhow::anyhow!("openh264 编码器初始化失败: {}", e))?;
-
-        tracing::info!(
-            "OpenH264 编码器已初始化: {}x{} @ {}fps, CBR 15Mbps, 屏幕实时模式",
-            width, height, fps,
-        );
-
-        Ok(Self {
-            encoder,
-            width,
-            height,
-            fps,
-            force_keyframe: false,
-            frame_count: 0,
-        })
+        )
+        .map_err(|e| anyhow::anyhow!("openh264 编码器初始化失败: {}", e))
     }
 }
 
@@ -156,13 +155,20 @@ impl VideoEncoder for OpenH264Encoder {
     fn encode(&mut self, frame: &CapturedFrame) -> anyhow::Result<Vec<EncodedFrame>> {
         self.frame_count += 1;
 
+        // 0. 如果请求了重建编码器，直接创建新实例（第一帧必为 IDR）
+        if self.reset_requested {
+            self.reset_requested = false;
+            self.force_keyframe = false;
+            self.encoder = Self::create_encoder(self.fps)?;
+            tracing::info!("编码器已重建，帧 #{}", self.frame_count);
+        }
+
         // 1. 转换 BGRA → YUV420P
         let yuv = bgra_to_yuv420p(&frame.cpu_buffer, frame.width as usize, frame.height as usize);
 
-        // 2. 如果需要关键帧，在编码前设置标志
+        // 2. 如果需要关键帧，在编码前设置标志（不提前消费——Skip 帧不消耗）
         if self.force_keyframe {
             self.encoder.force_intra_frame();
-            self.force_keyframe = false;
         }
 
         // 3. 编码
@@ -172,11 +178,17 @@ impl VideoEncoder for OpenH264Encoder {
 
         let raw_frame_type = bitstream.frame_type();
 
-        // 4. 检查是否被跳过
+        // 4. 检查是否被跳过（Skip 帧不消耗 force_keyframe）
         if raw_frame_type == openh264::encoder::FrameType::Skip
             || raw_frame_type == openh264::encoder::FrameType::Invalid
         {
             return Ok(Vec::new());
+        }
+
+        let was_forced = self.force_keyframe;
+        self.force_keyframe = false;
+        if was_forced {
+            tracing::info!("编码帧 #{}: 强制关键帧已产出", self.frame_count);
         }
 
         // 5. 写入编码数据
@@ -214,8 +226,9 @@ impl VideoEncoder for OpenH264Encoder {
     }
 
     fn request_keyframe(&mut self) {
-        self.force_keyframe = true;
-        tracing::debug!("编码器: 已请求强制关键帧");
+        // 重建编码器比 force_intra_frame 更可靠（ScreenContentRealTime 下可能忽略）
+        self.reset_requested = true;
+        tracing::info!("编码器: 已请求重建（下一帧产出 IDR）");
     }
 }
 

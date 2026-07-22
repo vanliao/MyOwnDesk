@@ -1,0 +1,4 @@
+listen_address = "0.0.0.0:21117"
+pre_shared_key = "336955517566dc83bf6de5c46bc8a59d173bbece94052ad95eca3d01fb7a19b8"
+heartbeat_interval_secs = 10
+heartbeat_timeout_secs = 30

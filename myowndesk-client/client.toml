@@ -5,5 +5,6 @@
 address = "127.0.0.1:21117"
 
 [device]
-id = ""                 # 设备标识，留空则自动使用主机名
-pre_shared_key = ""     # 从中继服务器的 relay.toml 复制
+id = "123"                 # 设备标识，留空则自动使用主机名
+pre_shared_key = "336955517566dc83bf6de5c46bc8a59d173bbece94052ad95eca3d01fb7a19b8"     # 从中继服务器的 relay.toml 复制
+target_device_id = "456"   # GUI 模式时发起 Pair 的目标设备 ID

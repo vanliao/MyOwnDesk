@@ -25,6 +25,9 @@ pub struct DeviceConfig {
     pub id: String,
     /// 预共享密钥（hex 编码，从中继服务器的 relay.toml 复制）
     pub pre_shared_key: String,
+    /// 远程目标设备 ID（控制端发起 Pair 时使用，服务模式忽略）
+    #[serde(default)]
+    pub target_device_id: String,
 }
 
 impl ClientConfig {
@@ -64,6 +67,7 @@ impl ClientConfig {
             device: DeviceConfig {
                 id: String::new(),
                 pre_shared_key: String::new(),
+                target_device_id: String::new(),
             },
         };
 
@@ -153,6 +157,7 @@ pre_shared_key = "aabbccdd001122334455"
             device: DeviceConfig {
                 id: "my-pc".to_string(),
                 pre_shared_key: "key".to_string(),
+                target_device_id: String::new(),
             },
         };
         assert_eq!(config.resolve_device_id(), "my-pc");
@@ -167,6 +172,7 @@ pre_shared_key = "aabbccdd001122334455"
             device: DeviceConfig {
                 id: "".to_string(),
                 pre_shared_key: "key".to_string(),
+                target_device_id: String::new(),
             },
         };
         // 空 ID 时回退到环境变量，如果都没有则回退到 "unknown"

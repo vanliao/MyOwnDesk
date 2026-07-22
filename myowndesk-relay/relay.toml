@@ -1,9 +1,9 @@
 # MyOwnDesk 中继服务器配置
-listen_address = "0.0.0.0:12345"
+listen_address = "0.0.0.0:21117"
 
 # 预共享密钥（首次启动自动生成 256-bit 随机密钥，复制到各客户端配置文件）
 # 格式：64 个 hex 字符
-pre_shared_key = ""
+pre_shared_key = "336955517566dc83bf6de5c46bc8a59d173bbece94052ad95eca3d01fb7a19b8"
 
 # 心跳间隔（秒）
 heartbeat_interval_secs = 10
