@@ -17,6 +17,7 @@
 
 use crate::config::ClientConfig;
 use crate::decoder::{create_best_decoder, DecodedFrame};
+use crate::keymap::minifb_key_to_vk;
 use crate::net::QuicClient;
 use minifb::{Key, Window, WindowOptions};
 use myowndesk_protocol as proto;
@@ -85,6 +86,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (nal_tx, mut nal_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (rgb_tx, rgb_rx) = mpsc::unbounded_channel::<DecodedFrame>();
     let (state_tx, state_rx) = mpsc::unbounded_channel::<StateUpdate>();
+    let (input_tx, input_rx) = mpsc::unbounded_channel::<proto::Message>();
 
     // 3. 网络 task
     let net_addr = config.server.address.clone();
@@ -94,7 +96,7 @@ pub async fn run() -> anyhow::Result<()> {
         anyhow::bail!("target_device_id 未配置，请在 client.toml 的 [device] 中添加");
     }
     let _net_task = tokio::spawn(async move {
-        if let Err(e) = run_network(&net_addr, &device_id, &net_psk, &target_device, nal_tx, state_tx).await {
+        if let Err(e) = run_network(&net_addr, &device_id, &net_psk, &target_device, nal_tx, state_tx, input_rx).await {
             tracing::error!("网络 task 异常退出: {}", e);
         }
         tracing::info!("网络 task 退出");
@@ -109,7 +111,7 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     // 5. minifb 窗口循环（阻塞直到关闭）
-    run_window(rgb_rx, state_rx)?;
+    run_window(rgb_rx, state_rx, input_tx)?;
 
     tracing::info!("GUI 模式退出");
     Ok(())
@@ -126,6 +128,7 @@ async fn run_network(
     target_device_id: &str,
     nal_tx: mpsc::UnboundedSender<Vec<u8>>,
     state_tx: mpsc::UnboundedSender<StateUpdate>,
+    input_rx: mpsc::UnboundedReceiver<proto::Message>,
 ) -> anyhow::Result<()> {
     let _ = state_tx.send(StateUpdate::State(ConnectionState::Connecting));
 
@@ -197,6 +200,31 @@ async fn run_network(
     let _ = state_tx.send(StateUpdate::State(ConnectionState::Receiving));
 
     let conn = client.connection.clone();
+
+    // 输入事件发送器：每条消息独立开流 + finish，避免阻塞中继的 stream 处理循环
+    let input_conn = client.connection.clone();
+    let input_sender = tokio::spawn(async move {
+        let mut input_rx = input_rx;
+        while let Some(msg) = input_rx.recv().await {
+            let payload = msg.encode_to_vec();
+            let len = (payload.len() as u32).to_le_bytes();
+            let (mut send, _recv) = match input_conn.open_bi().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("打开输入流失败: {}", e);
+                    break;
+                }
+            };
+            if send.write_all(&len).await.is_err() {
+                break;
+            }
+            if send.write_all(&payload).await.is_err() {
+                break;
+            }
+            let _ = send.finish();
+        }
+        tracing::info!("输入事件流已关闭");
+    });
 
     // datagram 接收 + 帧重组
     let nal_tx2 = nal_tx.clone();
@@ -295,7 +323,7 @@ async fn run_network(
         }
     });
 
-    let _ = tokio::join!(dgram_recv, stream_recv);
+    let _ = tokio::join!(dgram_recv, stream_recv, input_sender);
     Ok(())
 }
 
@@ -366,6 +394,7 @@ fn run_decoder(
 fn run_window(
     mut rgb_rx: mpsc::UnboundedReceiver<DecodedFrame>,
     mut state_rx: mpsc::UnboundedReceiver<StateUpdate>,
+    _input_tx: mpsc::UnboundedSender<proto::Message>,
 ) -> anyhow::Result<()> {
     let mut window = Window::new(
         "MyOwnDesk - 等待连接...",
@@ -382,6 +411,12 @@ fn run_window(
     let mut _connection_state = ConnectionState::Connecting;
     let mut frame_count: u64 = 0;
     let mut last_frame_size = [0u32, 2];
+
+    // ---- 鼠标捕获状态 ----
+    let mouse_threshold: f32 = 2.0;
+    let mut prev_mouse_pos: Option<(f32, f32)> = None;
+    let mut prev_mouse_buttons: [bool; 3] = [false, false, false];
+    let (mut frame_w, mut frame_h) = (DEFAULT_WIDTH as u32, DEFAULT_HEIGHT as u32);
 
     // 帧缓冲：32-bit ARGB (0RGB, 即 A 在最高字节)
     let mut buffer: Vec<u32> = vec![0u32; DEFAULT_WIDTH * DEFAULT_HEIGHT];
@@ -424,6 +459,64 @@ fn run_window(
             }
         }
 
+        // ---- 鼠标捕获 ----
+        if let Some(ref frame) = current_frame {
+            frame_w = frame.width;
+            frame_h = frame.height;
+        }
+        let win_size = window.get_size();
+        let win_w = win_size.0 as u32;
+        let win_h = win_size.1 as u32;
+
+        // 鼠标位置
+        if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Clamp) {
+            let host_x = if win_w > 0 { ((mx * frame_w as f32) / win_w as f32) as i32 } else { 0 };
+            let host_y = if win_h > 0 { ((my * frame_h as f32) / win_h as f32) as i32 } else { 0 };
+            let send_move = match prev_mouse_pos {
+                Some((px, py)) => (mx - px).abs() >= mouse_threshold || (my - py).abs() >= mouse_threshold,
+                None => true,
+            };
+            if send_move {
+                let msg = build_mouse_event(proto::MouseEventType::Move, host_x, host_y, proto::MouseButton::Left, 0);
+                let _ = _input_tx.send(msg);
+                // 反馈抑制：注入后光标预期在 (host_x - win_x, host_y - win_y)
+                let (win_x, win_y) = window.get_position();
+                prev_mouse_pos = Some((
+                    (host_x as f32 - win_x as f32).clamp(0.0, win_w.saturating_sub(1) as f32),
+                    (host_y as f32 - win_y as f32).clamp(0.0, win_h.saturating_sub(1) as f32),
+                ));
+            }
+            // 鼠标按键
+            for (i, mb) in [minifb::MouseButton::Left, minifb::MouseButton::Right, minifb::MouseButton::Middle].iter().enumerate() {
+                let down = window.get_mouse_down(*mb);
+                if down != prev_mouse_buttons[i] {
+                    let pb = [proto::MouseButton::Left, proto::MouseButton::Right, proto::MouseButton::Middle][i];
+                    let et = if down { proto::MouseEventType::ButtonDown } else { proto::MouseEventType::ButtonUp };
+                    let _ = _input_tx.send(build_mouse_event(et, 0, 0, pb, 0));
+                    prev_mouse_buttons[i] = down;
+                }
+            }
+            // 滚轮
+            if let Some(scroll) = window.get_scroll_wheel() {
+                let delta = scroll.1 as i32;
+                if delta != 0 {
+                    let _ = _input_tx.send(build_mouse_event(proto::MouseEventType::Wheel, 0, 0, proto::MouseButton::Left, delta));
+                }
+            }
+        }
+
+        // ---- 键盘捕获 ----
+        for key in window.get_keys_pressed(minifb::KeyRepeat::No) {
+            if let Some(vk) = minifb_key_to_vk(key) {
+                let _ = _input_tx.send(build_key_event(vk, true));
+            }
+        }
+        for key in window.get_keys_released() {
+            if let Some(vk) = minifb_key_to_vk(key) {
+                let _ = _input_tx.send(build_key_event(vk, false));
+            }
+        }
+
         // 更新窗口
         if current_frame.is_some() {
             let (w, h) = (
@@ -461,5 +554,89 @@ fn rgb24_to_argb(rgb24: &[u8], width: u32, height: u32, buffer: &mut [u32]) {
         buffer[i] = ((rgb24[src] as u32) << 16)   // R
             | ((rgb24[src + 1] as u32) << 8)       // G
             | (rgb24[src + 2] as u32);              // B
+    }
+}
+
+// ============================================================
+// 输入事件构造辅助（Ticket 08）
+// ============================================================
+
+fn build_mouse_event(
+    event_type: proto::MouseEventType,
+    x: i32,
+    y: i32,
+    button: proto::MouseButton,
+    wheel_delta: i32,
+) -> proto::Message {
+    proto::Message {
+        r#type: Some(proto::message::Type::MouseEvent(proto::MouseEvent {
+            event_type: event_type as i32,
+            x,
+            y,
+            button: button as i32,
+            wheel_delta,
+        })),
+    }
+}
+
+fn build_key_event(key_code: i32, pressed: bool) -> proto::Message {
+    proto::Message {
+        r#type: Some(proto::message::Type::KeyEvent(proto::KeyEvent {
+            key_code: key_code as u32,
+            pressed,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_mouse_move_event() {
+        let msg = build_mouse_event(proto::MouseEventType::Move, 960, 540, proto::MouseButton::Left, 0);
+        match msg.r#type {
+            Some(proto::message::Type::MouseEvent(me)) => {
+                assert_eq!(me.event_type, proto::MouseEventType::Move as i32);
+                assert_eq!(me.x, 960);
+                assert_eq!(me.y, 540);
+            }
+            _ => panic!("期望 MouseEvent"),
+        }
+    }
+
+    #[test]
+    fn test_build_mouse_wheel_event() {
+        let msg = build_mouse_event(proto::MouseEventType::Wheel, 0, 0, proto::MouseButton::Left, 120);
+        match msg.r#type {
+            Some(proto::message::Type::MouseEvent(me)) => {
+                assert_eq!(me.wheel_delta, 120);
+            }
+            _ => panic!("期望 MouseEvent"),
+        }
+    }
+
+    #[test]
+    fn test_build_key_press() {
+        let msg = build_key_event(0x41, true);
+        match msg.r#type {
+            Some(proto::message::Type::KeyEvent(ke)) => {
+                assert_eq!(ke.key_code, 0x41);
+                assert!(ke.pressed);
+            }
+            _ => panic!("期望 KeyEvent"),
+        }
+    }
+
+    #[test]
+    fn test_build_key_release() {
+        let msg = build_key_event(0x1B, false);
+        match msg.r#type {
+            Some(proto::message::Type::KeyEvent(ke)) => {
+                assert_eq!(ke.key_code, 0x1B);
+                assert!(!ke.pressed);
+            }
+            _ => panic!("期望 KeyEvent"),
+        }
     }
 }

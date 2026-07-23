@@ -3,5 +3,7 @@ pub mod config;
 pub mod decoder;
 pub mod encoder;
 pub mod gui;
+pub mod input;
+pub mod keymap;
 pub mod net;
 pub mod service;

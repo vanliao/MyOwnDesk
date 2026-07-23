@@ -19,6 +19,7 @@
 use crate::capture::{CapturedFrame, FrameSource, ScreenDuplicator};
 use crate::config::ClientConfig;
 use crate::encoder::{self, EncodedFrame};
+use crate::input::{DesktopInput, InputBackend};
 use crate::net::{KeyFrameSender, QuicClient};
 use myowndesk_protocol as proto;
 use prost::Message as _;
@@ -310,6 +311,9 @@ async fn network_task(
 
     let conn = client.connection.clone();
 
+    // 创建桌面输入注入实例（Ticket 08）
+    let input = DesktopInput::new();
+
     // 子 task A：datagram 发送
     let dgram_sender = tokio::spawn(async move {
         let mut frame_seq: u32 = 0;
@@ -355,11 +359,12 @@ async fn network_task(
     // 子 task B：stream 消息接收
     let conn_clone = client.connection.clone();
     let kf_tx = keyframe_tx.clone();
+    let mut input = input;
     let stream_receiver = tokio::spawn(async move {
         loop {
             match recv_stream_message(&conn_clone).await {
                 Ok(Some((send, msg))) => {
-                    handle_control_message(&conn_clone, msg, send, &kf_tx).await;
+                    handle_control_message(&conn_clone, msg, send, &kf_tx, &mut input).await;
                 }
                 Ok(None) => {
                     tracing::info!("中继连接已关闭");
@@ -409,6 +414,7 @@ async fn handle_control_message(
     msg: proto::Message,
     _send: quinn::SendStream,
     keyframe_tx: &KeyFrameSender,
+    input: &mut DesktopInput,
 ) {
     use proto::message::Type;
     match msg.r#type {
@@ -419,8 +425,33 @@ async fn handle_control_message(
         Some(Type::PeerDisconnected(pd)) => {
             tracing::warn!("对端已断开: {}", pd.reason);
         }
-        Some(Type::KeyEvent(_)) | Some(Type::MouseEvent(_)) => {
-            tracing::debug!("收到输入事件（暂未处理）");
+        Some(Type::KeyEvent(ke)) => {
+            tracing::debug!("注入键盘: code={}, pressed={}", ke.key_code, ke.pressed);
+            if let Err(e) = input.send_key(ke.key_code as i32, ke.pressed, false) {
+                tracing::error!("键盘注入失败: {}", e);
+            }
+        }
+        Some(Type::MouseEvent(me)) => {
+            let event_type = me.event_type.try_into().unwrap_or(proto::MouseEventType::Move);
+            match event_type {
+                proto::MouseEventType::Move => {
+                    if let Err(e) = input.send_mouse_move(me.x, me.y) {
+                        tracing::error!("鼠标移动注入失败: {}", e);
+                    }
+                }
+                proto::MouseEventType::ButtonDown | proto::MouseEventType::ButtonUp => {
+                    let pressed = event_type == proto::MouseEventType::ButtonDown;
+                    let button = me.button.try_into().unwrap_or(proto::MouseButton::Left);
+                    if let Err(e) = input.send_mouse_button(button, pressed) {
+                        tracing::error!("鼠标按键注入失败: {}", e);
+                    }
+                }
+                proto::MouseEventType::Wheel => {
+                    if let Err(e) = input.send_mouse_wheel(me.wheel_delta) {
+                        tracing::error!("鼠标滚轮注入失败: {}", e);
+                    }
+                }
+            }
         }
         Some(Type::Ping(ping)) => {
             let pong = proto::Message {
