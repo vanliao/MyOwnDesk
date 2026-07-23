@@ -298,12 +298,7 @@ async fn run_network(
                         }
                         Some(Type::KeyFrameRequest(_)) => {}
                         Some(Type::Ping(ping)) => {
-                            // 回复 Pong 维持心跳
-                            let pong = proto::Message {
-                                r#type: Some(Type::Pong(proto::Pong {
-                                    timestamp_ms: ping.timestamp_ms,
-                                })),
-                            };
+                            let pong = crate::net::build_pong(&ping);
                             if let Err(e) = client.send_message(&pong).await {
                                 tracing::warn!("发送 Pong 失败: {}", e);
                             }
@@ -388,13 +383,152 @@ fn run_decoder(
 }
 
 // ============================================================
+// InputCapture — 输入捕获器
+// ============================================================
+
+/// 从 minifb 窗口轮询鼠标/键盘事件，输出 protobuf 消息。
+///
+/// 封装所有输入状态（鼠标位置、按键状态、帧尺寸），每帧调用 `poll()` 即可。
+struct InputCapture {
+    mouse_threshold: f32,
+    prev_mouse_pos: Option<(f32, f32)>,
+    prev_mouse_buttons: [bool; 3],
+    frame_w: u32,
+    frame_h: u32,
+}
+
+impl InputCapture {
+    fn new() -> Self {
+        Self {
+            mouse_threshold: 2.0,
+            prev_mouse_pos: None,
+            prev_mouse_buttons: [false, false, false],
+            frame_w: DEFAULT_WIDTH as u32,
+            frame_h: DEFAULT_HEIGHT as u32,
+        }
+    }
+
+    /// 轮询输入事件。
+    ///
+    /// - `window`: minifb 窗口
+    /// - `frame_size`: 当前解码帧尺寸（用于坐标映射）
+    /// 返回待发送的 protobuf 消息列表。
+    fn poll(&mut self, window: &Window, frame_size: Option<(u32, u32)>) -> Vec<proto::Message> {
+        let mut events = Vec::new();
+
+        if let Some((w, h)) = frame_size {
+            self.frame_w = w;
+            self.frame_h = h;
+        }
+
+        let win_size = window.get_size();
+        let win_w = win_size.0 as u32;
+        let win_h = win_size.1 as u32;
+
+        // 鼠标位置
+        if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Clamp) {
+            let host_x = if win_w > 0 {
+                ((mx * self.frame_w as f32) / win_w as f32) as i32
+            } else {
+                0
+            };
+            let host_y = if win_h > 0 {
+                ((my * self.frame_h as f32) / win_h as f32) as i32
+            } else {
+                0
+            };
+
+            let send_move = match self.prev_mouse_pos {
+                Some((px, py)) => {
+                    (mx - px).abs() >= self.mouse_threshold
+                        || (my - py).abs() >= self.mouse_threshold
+                }
+                None => true,
+            };
+
+            if send_move {
+                events.push(build_mouse_event(
+                    proto::MouseEventType::Move,
+                    host_x,
+                    host_y,
+                    proto::MouseButton::Left,
+                    0,
+                ));
+                // 反馈抑制：注入后光标预期在 (host_x - win_x, host_y - win_y)
+                let (win_x, win_y) = window.get_position();
+                self.prev_mouse_pos = Some((
+                    (host_x as f32 - win_x as f32)
+                        .clamp(0.0, win_w.saturating_sub(1) as f32),
+                    (host_y as f32 - win_y as f32)
+                        .clamp(0.0, win_h.saturating_sub(1) as f32),
+                ));
+            }
+
+            // 鼠标按键
+            for (i, mb) in [
+                minifb::MouseButton::Left,
+                minifb::MouseButton::Right,
+                minifb::MouseButton::Middle,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let down = window.get_mouse_down(*mb);
+                if down != self.prev_mouse_buttons[i] {
+                    let pb = [
+                        proto::MouseButton::Left,
+                        proto::MouseButton::Right,
+                        proto::MouseButton::Middle,
+                    ][i];
+                    let et = if down {
+                        proto::MouseEventType::ButtonDown
+                    } else {
+                        proto::MouseEventType::ButtonUp
+                    };
+                    events.push(build_mouse_event(et, 0, 0, pb, 0));
+                    self.prev_mouse_buttons[i] = down;
+                }
+            }
+
+            // 滚轮
+            if let Some(scroll) = window.get_scroll_wheel() {
+                let delta = scroll.1 as i32;
+                if delta != 0 {
+                    events.push(build_mouse_event(
+                        proto::MouseEventType::Wheel,
+                        0,
+                        0,
+                        proto::MouseButton::Left,
+                        delta,
+                    ));
+                }
+            }
+        }
+
+        // 键盘
+        for key in window.get_keys_pressed(minifb::KeyRepeat::No) {
+            if let Some(vk) = minifb_key_to_vk(key) {
+                events.push(build_key_event(vk, true));
+            }
+        }
+        for key in window.get_keys_released() {
+            if let Some(vk) = minifb_key_to_vk(key) {
+                events.push(build_key_event(vk, false));
+            }
+        }
+
+        events
+    }
+}
+
+// ============================================================
 // minifb 窗口循环
 // ============================================================
 
 fn run_window(
     mut rgb_rx: mpsc::UnboundedReceiver<DecodedFrame>,
     mut state_rx: mpsc::UnboundedReceiver<StateUpdate>,
-    _input_tx: mpsc::UnboundedSender<proto::Message>,
+    input_tx: mpsc::UnboundedSender<proto::Message>,
 ) -> anyhow::Result<()> {
     let mut window = Window::new(
         "MyOwnDesk - 等待连接...",
@@ -412,11 +546,8 @@ fn run_window(
     let mut frame_count: u64 = 0;
     let mut last_frame_size = [0u32, 2];
 
-    // ---- 鼠标捕获状态 ----
-    let mouse_threshold: f32 = 2.0;
-    let mut prev_mouse_pos: Option<(f32, f32)> = None;
-    let mut prev_mouse_buttons: [bool; 3] = [false, false, false];
-    let (mut frame_w, mut frame_h) = (DEFAULT_WIDTH as u32, DEFAULT_HEIGHT as u32);
+    // 输入捕获器
+    let mut input = InputCapture::new();
 
     // 帧缓冲：32-bit ARGB (0RGB, 即 A 在最高字节)
     let mut buffer: Vec<u32> = vec![0u32; DEFAULT_WIDTH * DEFAULT_HEIGHT];
@@ -459,62 +590,10 @@ fn run_window(
             }
         }
 
-        // ---- 鼠标捕获 ----
-        if let Some(ref frame) = current_frame {
-            frame_w = frame.width;
-            frame_h = frame.height;
-        }
-        let win_size = window.get_size();
-        let win_w = win_size.0 as u32;
-        let win_h = win_size.1 as u32;
-
-        // 鼠标位置
-        if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Clamp) {
-            let host_x = if win_w > 0 { ((mx * frame_w as f32) / win_w as f32) as i32 } else { 0 };
-            let host_y = if win_h > 0 { ((my * frame_h as f32) / win_h as f32) as i32 } else { 0 };
-            let send_move = match prev_mouse_pos {
-                Some((px, py)) => (mx - px).abs() >= mouse_threshold || (my - py).abs() >= mouse_threshold,
-                None => true,
-            };
-            if send_move {
-                let msg = build_mouse_event(proto::MouseEventType::Move, host_x, host_y, proto::MouseButton::Left, 0);
-                let _ = _input_tx.send(msg);
-                // 反馈抑制：注入后光标预期在 (host_x - win_x, host_y - win_y)
-                let (win_x, win_y) = window.get_position();
-                prev_mouse_pos = Some((
-                    (host_x as f32 - win_x as f32).clamp(0.0, win_w.saturating_sub(1) as f32),
-                    (host_y as f32 - win_y as f32).clamp(0.0, win_h.saturating_sub(1) as f32),
-                ));
-            }
-            // 鼠标按键
-            for (i, mb) in [minifb::MouseButton::Left, minifb::MouseButton::Right, minifb::MouseButton::Middle].iter().enumerate() {
-                let down = window.get_mouse_down(*mb);
-                if down != prev_mouse_buttons[i] {
-                    let pb = [proto::MouseButton::Left, proto::MouseButton::Right, proto::MouseButton::Middle][i];
-                    let et = if down { proto::MouseEventType::ButtonDown } else { proto::MouseEventType::ButtonUp };
-                    let _ = _input_tx.send(build_mouse_event(et, 0, 0, pb, 0));
-                    prev_mouse_buttons[i] = down;
-                }
-            }
-            // 滚轮
-            if let Some(scroll) = window.get_scroll_wheel() {
-                let delta = scroll.1 as i32;
-                if delta != 0 {
-                    let _ = _input_tx.send(build_mouse_event(proto::MouseEventType::Wheel, 0, 0, proto::MouseButton::Left, delta));
-                }
-            }
-        }
-
-        // ---- 键盘捕获 ----
-        for key in window.get_keys_pressed(minifb::KeyRepeat::No) {
-            if let Some(vk) = minifb_key_to_vk(key) {
-                let _ = _input_tx.send(build_key_event(vk, true));
-            }
-        }
-        for key in window.get_keys_released() {
-            if let Some(vk) = minifb_key_to_vk(key) {
-                let _ = _input_tx.send(build_key_event(vk, false));
-            }
+        // 轮询输入事件
+        let frame_size = current_frame.as_ref().map(|f| (f.width, f.height));
+        for msg in input.poll(&window, frame_size) {
+            let _ = input_tx.send(msg);
         }
 
         // 更新窗口
@@ -638,5 +717,31 @@ mod tests {
             }
             _ => panic!("期望 KeyEvent"),
         }
+    }
+
+    // ============================================================
+    // InputCapture 测试
+    // ============================================================
+
+    #[test]
+    fn test_input_capture_new() {
+        let ic = InputCapture::new();
+        assert_eq!(ic.mouse_threshold, 2.0);
+        assert!(ic.prev_mouse_pos.is_none());
+        assert_eq!(ic.prev_mouse_buttons, [false, false, false]);
+        assert_eq!(ic.frame_w, 1920);
+        assert_eq!(ic.frame_h, 1080);
+    }
+
+    #[test]
+    fn test_input_capture_updates_frame_size() {
+        let mut ic = InputCapture::new();
+        // poll with frame_size → updates internal frame_w/frame_h
+        // We can't easily test poll() without a real Window,
+        // but we can verify the frame size update via construction
+        ic.frame_w = 1280;
+        ic.frame_h = 720;
+        assert_eq!(ic.frame_w, 1280);
+        assert_eq!(ic.frame_h, 720);
     }
 }

@@ -158,30 +158,32 @@ async fn handle_connection(
     let stream_device = device_id.clone();
     let stream_conn = connection.clone();
     tokio::spawn(async move {
-        // 读取所有消息：同一 bi-stream 上可发多条消息，减少 stream 创建开销
+        // 每条 bi-stream 由独立 task 处理，避免长生命周期流阻塞后续 stream 的 accept
         loop {
             match stream_conn.accept_bi().await {
                 Ok((mut send, mut recv)) => {
-                    loop {
-                        match relay::read_message(&mut recv).await {
-                            Ok(Some(msg)) => {
-                                handle_control_message(
-                                    &stream_state,
-                                    &stream_device,
-                                    msg,
-                                    &mut send,
-                                )
-                                .await;
-                                // send 保留（仅 Pair/Ping 写入响应，不 finish），
-                                // 继续读取本条 stream 上的下一条消息
-                            }
-                            Ok(None) => break, // stream 正常关闭
-                            Err(e) => {
-                                warn!("消息解析失败: {}", e);
-                                break;
+                    let task_state = stream_state.clone();
+                    let task_device = stream_device.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match relay::read_message(&mut recv).await {
+                                Ok(Some(msg)) => {
+                                    handle_control_message(
+                                        &task_state,
+                                        &task_device,
+                                        msg,
+                                        &mut send,
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!("消息解析失败: {}", e);
+                                    break;
+                                }
                             }
                         }
-                    }
+                    });
                 }
                 Err(e) => {
                     // 连接关闭是正常情况

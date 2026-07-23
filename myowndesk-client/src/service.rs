@@ -454,11 +454,7 @@ async fn handle_control_message(
             }
         }
         Some(Type::Ping(ping)) => {
-            let pong = proto::Message {
-                r#type: Some(Type::Pong(proto::Pong {
-                    timestamp_ms: ping.timestamp_ms,
-                })),
-            };
+            let pong = crate::net::build_pong(&ping);
             let payload = pong.encode_to_vec();
             let len = (payload.len() as u32).to_le_bytes();
             if let Ok((mut s, _r)) = conn.open_bi().await {
